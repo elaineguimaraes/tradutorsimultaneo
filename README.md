@@ -351,3 +351,12 @@ Componentes de terceiros utilizados:
 | [edge-tts](https://github.com/rany2/edge-tts) | síntese de voz neural pt-BR | GPL-3.0 (dependência via pip) |
 | [pyttsx3](https://github.com/nateshmbhat/pyttsx3) | síntese de voz offline (SAPI) | MPL-2.0 |
 | [VB-CABLE](https://vb-audio.com/Cable/) | driver de áudio virtual | licença própria da VB-Audio, instalado separadamente |
+
+## Outros projetos
+
+[LangCoach](https://langcoach.ia.br): treino de entrevistas de emprego em
+inglês pelo WhatsApp. Você recebe perguntas por áudio e texto, responde por
+voz e ganha feedback sobre o inglês, o conteúdo e a forma como apresentou suas
+experiências e resultados. Ao final de cada sessão chega um relatório em PDF
+com os pontos a melhorar, que serve de guia de estudo com professor
+particular, com IA ou em cursos.
