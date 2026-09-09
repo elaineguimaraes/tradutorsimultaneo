@@ -173,6 +173,7 @@ ignorado.
 | Ducking | quanto o áudio original ABAIXA enquanto a voz traduzida está falando |
 | Voz | escolha entre Francisca, Thalita ou Antônio (vozes neurais pt-BR) |
 | Velocidade | velocidade base da voz: 1,0 / 1,25 / 1,5 |
+| Tema | conjunto de regras de jargão em uso (arquivos em `glossarios/`) |
 | A- / A+ | diminui/aumenta o tamanho da fonte da legenda |
 | Clique atravessa a legenda | o mouse passa direto pela legenda, sem atrapalhar cliques em janelas por baixo |
 | Mostrar/ocultar legenda | liga ou desliga a legenda flutuante |
@@ -189,11 +190,50 @@ detectado é inglês, a voz está 3,2 segundos atrás do que está tocando ao
 vivo, e a velocidade da voz foi acelerada em 10% para tentar alcançar. Quando
 o locutor faz uma pausa, o atraso tende a diminuir sozinho.
 
-## Jargão financeiro e glossário
+## Glossários por tema
 
 O diferencial do projeto é o glossário: um conjunto de regras que corrige o
-comportamento padrão do tradutor automático para o jargão real de quem
-acompanha e opera nos mercados financeiros. Alguns exemplos:
+comportamento padrão do tradutor automático para o jargão real de um
+domínio específico. O app vem com dois temas prontos, cada um num arquivo
+`glossarios/<nome>.json`:
+
+| Tema | Arquivo | Conteúdo |
+|---|---|---|
+| `trading` (padrão) | `glossarios/trading.json` | jargão de mercado financeiro/day trade (ver exemplos abaixo) |
+| `geral` | `glossarios/geral.json` | neutro, sem regras específicas; usa só o modelo de tradução |
+
+A escolha do tema é feita pelo combo **Tema** no painel ou pela chave
+`glossario` do `config.json`. Com o app rodando, a troca vale na hora, a
+partir da próxima frase; antes do primeiro Iniciar, vale quando o app iniciar.
+
+Cada arquivo de tema tem os campos `nome` e `descricao` (usados no combo da
+interface), o booleano `regras_de_mercado` e quatro listas:
+
+| Lista | Efeito |
+|---|---|
+| `proteger` | termos que ficam em inglês, sem tradução (nomes, siglas, jargão sem equivalente natural) |
+| `tickers` | símbolos de bolsa expandidos para o nome da empresa na fala (AAPL → Apple) |
+| `traduzir` | traduções fixas aplicadas antes de o texto chegar ao modelo de tradução |
+| `corrigir` | substituições aplicadas na saída em português, depois da tradução |
+
+**As listas do arquivo substituem (não somam a) os padrões embutidos** em
+`src/tradutor/glossary.py` (que correspondem ao tema `trading`). Se você
+remover um termo do JSON, ele deixa de valer, mesmo que exista um padrão
+equivalente no código.
+
+Além das quatro listas, existe um conjunto de correções fixas de CONTEXTO de
+mercado financeiro que não vêm do JSON (ficam embutidas no código, em
+`src/tradutor/glossary.py`): "trade" como substantivo, "the high"/"the low"
+virando topo/fundo, número solto nunca ser lido como idade e a concordância
+de gênero dos substantivos de mercado. O campo `regras_de_mercado` liga
+(`true`) ou desliga (`false`) esse conjunto inteiro. Temas de outras áreas
+(que não sejam mercado financeiro) devem usar `false`, porque essas regras
+fixas fariam sentido só no domínio de trading (por exemplo, "the high" só
+deve virar "topo" quando o assunto é o preço de um ativo).
+
+Exemplos do tema `trading` (mais de **1.200 regras** ao todo: ≈100 termos
+protegidos, 22 tickers expandidos, ≈590 traduções fixas e ≈510 correções
+pós-tradução):
 
 | Inglês | Português | Observação |
 |---|---|---|
@@ -214,22 +254,7 @@ acompanha e opera nos mercados financeiros. Alguns exemplos:
 | `dip` | queda | |
 | `be up` / `be down` | no lucro / no negativo | |
 
-A lista completa está em `docs/DECISOES-TECNICAS.md`.
-
-O comportamento do glossário é controlado por `glossario.json`, na raiz do
-projeto, com quatro listas:
-
-| Lista | Efeito |
-|---|---|
-| `proteger` | termos que ficam em inglês, sem tradução (nomes, siglas, jargão sem equivalente natural) |
-| `tickers` | símbolos de bolsa expandidos para o nome da empresa na fala (AAPL → Apple) |
-| `traduzir` | traduções fixas aplicadas antes de o texto chegar ao modelo de tradução |
-| `corrigir` | substituições aplicadas na saída em português, depois da tradução |
-
-Para personalizar: edite o `glossario.json` e reinicie o app para recarregar.
-**As listas do arquivo substituem (não somam a) os padrões embutidos** em
-`src/tradutor/glossary.py`. Se você remover um termo do JSON, ele deixa de
-valer, mesmo que exista um padrão equivalente no código.
+A lista completa do tema `trading` está em `docs/DECISOES-TECNICAS.md`.
 
 Para auditar a qualidade da tradução, mude `gravar_log` para `true` no
 `config.json` (vem desligado por padrão), reinicie o app e deixe-o rodando
@@ -265,6 +290,7 @@ versionado**, porque guarda estado específico da máquina onde o app roda
 | `rate_ladder` | `[[2.0, 10], [5.0, 25], [9.0, 40]]` | escada de atraso (s) → aceleração da voz (%) |
 | `max_backlog_s` | `12.0` | atraso acumulado (s) acima do qual o app pula para o ao vivo |
 | `gravar_log` | `false` | `true` grava `traducoes.log` com as 4 etapas de cada frase (auditoria de tradução) |
+| `glossario` | `"trading"` | tema do glossário (nome do arquivo em `glossarios/`, sem `.json`) |
 | `show_subtitles` | `true` | exibe a legenda flutuante |
 | `subtitle_font_size` | `18` | tamanho da fonte da legenda |
 | `subtitle_pos` | `null` | posição salva da legenda na tela |
@@ -278,7 +304,7 @@ versionado**, porque guarda estado específico da máquina onde o app roda
 | App não lista o CABLE | O Windows enumera dispositivos na abertura do processo. Feche e abra o app de novo |
 | Sem voz traduzida, legenda OK | Falta de internet para o Edge-TTS. Procure "só voz offline" no `tradutor.log`: o app já caiu para a voz SAPI offline |
 | Primeira frase demora para sair | Carregamento dos modelos na primeira execução; estabiliza logo depois |
-| Tradução ruim em algum jargão específico | Edite o `glossario.json` e audite o `traducoes.log` para ver onde a tradução desviou |
+| Tradução ruim em algum jargão específico | Edite o arquivo do tema em `glossarios/` e audite o `traducoes.log` para ver onde a tradução desviou |
 | Tradução sai em português de Portugal ("registou", "ações" viram "acções") | O tradutor Opus-MT não ficou pronto na instalação e o app está usando o Argos de reserva. Rode `.venv\Scripts\python.exe scripts\preparar_modelos.py` e confira se imprime `backend=ct2` |
 | Ao reabrir, avisa "já está aberto" | Um processo anterior ficou preso ao fechar. Feche pelo Gerenciador de Tarefas e abra de novo |
 | App trava | Olhe o `tradutor.log` primeiro, que é o log geral da aplicação |
@@ -320,6 +346,29 @@ Logs de diagnóstico: `tradutor.log` (log geral, rotativo) e `traducoes.log`
 versionados. Documentação técnica completa (decisões de modelo,
 anti-repetição, manutenção do glossário, armadilhas conhecidas) em
 [`docs/DECISOES-TECNICAS.md`](docs/DECISOES-TECNICAS.md).
+
+## Contribuindo
+
+Há dois caminhos para contribuir com o projeto:
+
+1. **Novo tema (outro segmento):** copie `glossarios/geral.json` (já vem com
+   `regras_de_mercado` em `false`) para `glossarios/<seu-tema>.json` (nome
+   curto, minúsculo, sem espaços ou acentos), preencha os campos `nome` e
+   `descricao`, adicione as regras (`proteger`, `tickers`, `traduzir`,
+   `corrigir`), rode `tests\test_glossary.py` (ele valida todos os temas em
+   `glossarios/`) e abra um Pull Request só com esse arquivo. Dicas: comece
+   pela lista `proteger` (o que deve ficar em inglês) e pela lista `corrigir`
+   (o que o tradutor erra); use o `traducoes.log` para achar os erros de
+   tradução do seu domínio; mantenha `regras_de_mercado` em `false`, a menos
+   que o seu tema também seja sobre mercado financeiro; não inclua dados
+   pessoais ou de terceiros.
+2. **Melhorias no tema `trading` ou no código:** abra um Pull Request com o
+   trecho do `traducoes.log` (o texto em inglês ouvido e o texto final em
+   português) que mostra o erro, junto com a regra proposta.
+
+Sugestões e problemas: abra uma Issue no repositório.
+
+Veja também [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Limitações conhecidas
 

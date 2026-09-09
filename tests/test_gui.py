@@ -111,6 +111,15 @@ class FakeController:
     def set_duck_level(self, value: float) -> None:
         print(f"[fake] set_duck_level({value:.2f})")
 
+    def set_tts_speed(self, value: float) -> None:
+        print(f"[fake] set_tts_speed({value:.2f})")
+
+    def set_tts_voice(self, name: str) -> None:
+        print(f"[fake] set_tts_voice({name!r})")
+
+    def set_glossary(self, name: str) -> None:
+        print(f"[fake] set_glossary({name!r})")
+
     def set_capture_device(self, name: str) -> None:
         print(f"[fake] set_capture_device({name!r})")
 

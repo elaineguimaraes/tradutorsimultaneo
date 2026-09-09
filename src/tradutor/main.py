@@ -54,6 +54,7 @@ class Pipeline:
         self._transcriber = None
         self._translator = None
         self._speaker = None
+        self._glossary = None
         self._tts_pool: Optional[ThreadPoolExecutor] = None
         self._threads: list[threading.Thread] = []
         self._components_ready = False
@@ -102,9 +103,9 @@ class Pipeline:
                                         compute_type="int8", cpu_threads=8)
         self._translator = Translator(target="pt")
         self._translator.ensure_ready(["en"])
-        from tradutor.glossary import Glossary, set_quality_log
+        from tradutor.glossary import Glossary, set_quality_log, theme_path
         set_quality_log(getattr(cfg, "gravar_log", True))
-        self._glossary = Glossary()
+        self._glossary = Glossary(theme_path(cfg.glossario))
         self._speaker = TtsSpeaker(voice=cfg.tts_voice)
         self._capture = LoopbackCapture(device_hint=cfg.capture_device_hint,
                                         samplerate=SR_NATIVE)
@@ -466,6 +467,30 @@ class Pipeline:
         self.config.tts_voice = name
         if self._speaker is not None:
             self._speaker.voice = name
+
+    def set_glossary(self, name: str) -> None:
+        """Troca o tema do glossário na hora (a frase em curso termina no antigo).
+
+        Carregar um tema compila centenas de regexes (~0,1 s), então roda numa
+        thread para não travar a interface; a troca do atributo é atômica e o
+        estágio de tradução lê `self._glossary` a cada frase.
+        """
+        name = (name or "").strip()
+        if not name:
+            return
+        self.config.glossario = name
+        if self._glossary is None:      # antes do primeiro start: vale quando ele iniciar
+            return
+
+        def _load() -> None:
+            from tradutor.glossary import Glossary, theme_path
+            try:
+                self._glossary = Glossary(theme_path(name))
+                log.info("glossário trocado para %s", name)
+            except Exception:
+                log.exception("falha ao carregar o glossário %s", name)
+
+        threading.Thread(target=_load, name="glossario", daemon=True).start()
 
     def _apply_duck(self) -> None:
         """duck do mixer = ganho restante: gain_original × (1 − redução)."""

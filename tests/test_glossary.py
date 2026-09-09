@@ -2,7 +2,7 @@
 
 Executar:  .venv\\Scripts\\python.exe tests\\test_glossary.py
 
-Não depende de pytest. Usa o `glossario.json` real da raiz do projeto (para
+Não depende de pytest. Usa o `glossarios/trading.json` real do projeto (para
 pegar regressões introduzidas por edição do arquivo) e uma `translate_fn`
 identidade, que devolve o texto já mascarado, sem passar por um MT de
 verdade, então os asserts checam o texto MASCARADO ou o `unmask`+`fix` final,
@@ -17,7 +17,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "src"))
 
-from tradutor.glossary import Glossary, _fix_unk  # noqa: E402
+from tradutor.glossary import (Glossary, GLOSSARIOS_DIR, _fix_unk,  # noqa: E402
+                               list_themes, theme_path)
 
 try:  # acentos no console do Windows
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -25,7 +26,7 @@ except Exception:  # noqa: BLE001
     pass
 
 _GLOSSARIO_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "glossario.json")
+    os.path.dirname(os.path.abspath(__file__)), "..", "glossarios", "trading.json")
 
 
 def _identity(text: str) -> str:
@@ -268,28 +269,96 @@ def test_glossary_carrega_sem_excecao() -> None:
     assert len(gl._protect_re) > 0
 
 
+def _all_theme_files() -> list:
+    return sorted(f for f in os.listdir(GLOSSARIOS_DIR) if f.endswith(".json"))
+
+
+def test_list_themes() -> None:
+    themes = list_themes()
+    nomes = [nome for nome, _ in themes]
+    assert "trading" in nomes, themes
+    assert "geral" in nomes, themes
+    assert nomes[0] == "trading", themes
+    rotulos = dict(themes)
+    assert rotulos["trading"] == "Mercado financeiro (trading)", themes
+    assert rotulos["geral"] == "Geral (sem jargão)", themes
+
+
+def test_tema_geral_carrega() -> None:
+    # "geral" desliga `regras_de_mercado`: _TRADE_NOUN_RE e _HILO_RE (que
+    # rodavam sempre em mask(), independente do tema) agora ficam fora, então
+    # "The Fed hit the high" não mascara nada.
+    gl = Glossary(theme_path("geral"))
+    masked, found = gl.mask("The Fed hit the high")
+    assert "XPROTECTED" not in masked, masked
+    assert found == [], found
+    masked2, found2 = gl.mask("The Fed said the meeting went well")
+    assert "XPROTECTED" not in masked2, masked2
+    assert found2 == [], found2
+    # não deve lançar exceção
+    gl.fix("The Fed hit the high")
+    # regra de mercado desligada: "anos fantasma" não é removido no tema geral
+    out = gl.fix("aos 57 anos", "at 57")
+    assert out == "aos 57 anos", out
+    # no tema trading (regra ligada) o "anos" fantasma continua sendo removido
+    gl_trading = _new_glossary()
+    out2 = gl_trading.fix("Comprei aos 57 anos", "I bought at 57")
+    assert "anos" not in out2, out2
+
+
+def test_todos_os_temas_validos() -> None:
+    import json
+    for fname in _all_theme_files():
+        path = os.path.join(GLOSSARIOS_DIR, fname)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        assert "nome" in data, fname
+        assert isinstance(data.get("proteger", []), list), fname
+        assert isinstance(data.get("traduzir", {}), dict), fname
+        assert isinstance(data.get("corrigir", {}), dict), fname
+        assert isinstance(data.get("tickers", {}), dict), fname
+        if "regras_de_mercado" in data:
+            assert isinstance(data["regras_de_mercado"], bool), fname
+        Glossary(path)  # não deve lançar exceção
+
+
+def test_market_flag_padrao_e_arquivo_ausente() -> None:
+    gl_trading = Glossary(theme_path("trading"))
+    assert gl_trading._market is True
+    # tema inexistente: cai nos padrões embutidos (que são os do trading),
+    # `regras_de_mercado` não existe no JSON (porque o arquivo não existe),
+    # então o padrão True se aplica e o carregamento não lança exceção.
+    gl_ausente = Glossary(theme_path("nao-existe"))
+    assert gl_ausente._market is True
+    assert len(gl_ausente._fix) > 0
+
+
 def test_corrigir_sem_entradas_mortas() -> None:
     """N3: nenhuma chave curta pode vir antes de uma chave mais longa que a
-    contém como palavra inteira (a curta dispara primeiro e mata a longa)."""
+    contém como palavra inteira (a curta dispara primeiro e mata a longa).
+    Roda para todos os temas em glossarios/, não só o de trading."""
     import json
     import re as _re
-    with open(_GLOSSARIO_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    keys = list(data["corrigir"].keys())
 
     def contains_whole(big: str, small: str) -> bool:
         pattern = r"(?<![\w])" + _re.escape(small) + r"(?![\w])"
         return _re.search(pattern, big, _re.IGNORECASE) is not None
 
-    dead = []
-    for i, long_k in enumerate(keys):
-        for j in range(i):
-            short_k = keys[j]
-            if short_k == long_k:
-                continue
-            if len(short_k) < len(long_k) and contains_whole(long_k, short_k):
-                dead.append((short_k, long_k))
-    assert dead == [], dead
+    for fname in _all_theme_files():
+        path = os.path.join(GLOSSARIOS_DIR, fname)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        keys = list(data.get("corrigir", {}).keys())
+
+        dead = []
+        for i, long_k in enumerate(keys):
+            for j in range(i):
+                short_k = keys[j]
+                if short_k == long_k:
+                    continue
+                if len(short_k) < len(long_k) and contains_whole(long_k, short_k):
+                    dead.append((short_k, long_k))
+        assert dead == [], (fname, dead)
 
 
 TESTS = [
@@ -316,6 +385,10 @@ TESTS = [
     test_move_play_nao_se_confundem,
     test_glossario_json_valido,
     test_glossary_carrega_sem_excecao,
+    test_list_themes,
+    test_tema_geral_carrega,
+    test_todos_os_temas_validos,
+    test_market_flag_padrao_e_arquivo_ausente,
     test_corrigir_sem_entradas_mortas,
 ]
 

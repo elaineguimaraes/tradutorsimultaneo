@@ -2,13 +2,15 @@
 
 Implementa `GuiProtocol` de `contracts.py`:
 
-* **Painel de controle**: janela normal (~420x380) com Iniciar/Pausar, "Ao vivo",
-  três sliders de volume, combos de dispositivo, linha de status ao vivo e
-  controles da legenda (tamanho de fonte, click-through, texto original).
+* **Painel de controle**: janela normal (~420x530) com Iniciar/Pausar, "Ao vivo",
+  três sliders de volume, combo de tema do glossário, combos de dispositivo,
+  linha de status ao vivo e controles da legenda (tamanho de fonte,
+  click-through, texto original).
 * **Overlay de legenda**: `Toplevel` sem borda, sempre no topo, semitransparente,
   arrastável, com auto-hide por fade após 6 s sem legenda nova.
 
-A GUI só conhece `contracts`, `config` e `tkinter`; nada de áudio/ASR aqui.
+A GUI só conhece `contracts`, `config`, `glossary` (lista de temas) e
+`tkinter`; nada de áudio/ASR aqui.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from typing import Optional
 
 from .config import AppConfig
 from .contracts import ControllerProtocol, UiState
+from .glossary import list_themes
 
 log = logging.getLogger("tradutor.gui")
 
@@ -433,11 +436,12 @@ class App:
         self._subtitles: "queue.Queue[tuple[str, str]]" = queue.Queue()
         self._running = False
         self._closing = False
+        self._themes = list_themes() or [("trading", "Mercado financeiro")]
 
         self._root = tk.Tk()
         self._root.title("Tradutor Simultâneo")
-        self._root.geometry("420x500")
-        self._root.minsize(400, 470)
+        self._root.geometry("420x530")
+        self._root.minsize(400, 500)
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._style = ttk.Style(self._root)
@@ -522,6 +526,24 @@ class App:
         self._cbo_voice.current(ids.index(atual) if atual in ids else 0)
         self._cbo_voice.grid(row=4, column=1, columnspan=2, sticky="w")
         self._cbo_voice.bind("<<ComboboxSelected>>", self._on_voice_selected)
+
+        lbl_theme = ttk.Label(sliders, text="Tema")
+        lbl_theme.grid(row=5, column=0, sticky="w", pady=3)
+        self._cbo_theme = ttk.Combobox(
+            sliders, state="readonly", width=24,
+            values=[rotulo for _, rotulo in self._themes])
+        nomes_tema = [nome for nome, _ in self._themes]
+        atual_tema = getattr(cfg, "glossario", self._themes[0][0])
+        if atual_tema not in nomes_tema:
+            # tema salvo foi removido da pasta: volta ao padrão de forma explícita,
+            # para GUI e pipeline concordarem desde já (e não só no próximo save)
+            atual_tema = self._themes[0][0]
+            cfg.glossario = atual_tema
+        self._cbo_theme.current(nomes_tema.index(atual_tema))
+        self._cbo_theme.grid(row=5, column=1, columnspan=2, sticky="w")
+        self._cbo_theme.bind("<<ComboboxSelected>>", self._on_theme_selected)
+        _Tooltip(self._cbo_theme,
+                 "Conjunto de regras de jargão. Novos temas: arquivos em glossarios/")
 
         ttk.Separator(outer).pack(fill="x", pady=6)
 
@@ -663,6 +685,10 @@ class App:
     def _on_voice_selected(self, _event: object = None) -> None:
         idx = max(0, self._cbo_voice.current())
         self._safe(self._controller.set_tts_voice, self._VOICES[idx][1])
+
+    def _on_theme_selected(self, _event: object = None) -> None:
+        idx = max(0, self._cbo_theme.current())
+        self._safe(self._controller.set_glossary, self._themes[idx][0])
 
     def _on_capture_selected(self, _event: object = None) -> None:
         """Item 0 = padrão do sistema, enviado como string vazia."""
@@ -826,6 +852,7 @@ class App:
         cfg.gain_tts = round(self._var_tts.get() / 100.0, 3)
         cfg.tts_speed = float(self._var_speed.get())
         cfg.tts_voice = self._VOICES[max(0, self._cbo_voice.current())][1]
+        cfg.glossario = self._themes[max(0, self._cbo_theme.current())][0]
         cfg.subtitle_font_size = self._overlay.font_size
         cfg.overlay_click_through = bool(self._var_click_through.get())
         cfg.show_subtitles = bool(self._var_show_overlay.get())

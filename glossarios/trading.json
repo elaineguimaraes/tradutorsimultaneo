@@ -1,5 +1,8 @@
 {
+  "nome": "Mercado financeiro (trading)",
+  "descricao": "Lives de day trade, análise técnica e notícias de mercado em inglês.",
   "auto_proteger_nomes": false,
+  "regras_de_mercado": true,
   "proteger": [
     "Federal Reserve",
     "Fed chair",

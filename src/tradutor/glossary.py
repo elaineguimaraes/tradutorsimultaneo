@@ -5,8 +5,11 @@ modelo comprovadamente preserva (``XPROTECTEDnX``); depois são restauradas com
 a grafia original. Um mapa de correções pós-tradução serve de rede de
 segurança (ex.: "Reserva Federal" -> "Federal Reserve").
 
-O usuário pode editar ``glossario.json`` na raiz do projeto:
+O usuário pode editar ``glossarios/<tema>.json`` (um arquivo por tema, ver
+`theme_path`/`list_themes` abaixo). O tema padrão é `trading`:
     {
+      "nome": "Mercado financeiro (trading)",
+      "descricao": "...",
       "proteger": ["Federal Reserve", "Fed", ...],
       "corrigir": {"Reserva Federal": "Federal Reserve", ...}
     }
@@ -20,9 +23,51 @@ import json
 import logging
 import os
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger("tradutor.glossario")
+
+# Raiz do projeto (.../src/tradutor/glossary.py -> .../)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+GLOSSARIOS_DIR = os.path.join(_PROJECT_ROOT, "glossarios")
+DEFAULT_THEME = "trading"
+
+
+def theme_path(name: str) -> str:
+    """Caminho do arquivo JSON do tema `name` (só o nome, sem extensão)."""
+    safe = os.path.basename((name or DEFAULT_THEME).strip()) or DEFAULT_THEME
+    return os.path.join(GLOSSARIOS_DIR, f"{safe}.json")
+
+
+def list_themes() -> List[Tuple[str, str]]:
+    """Temas disponíveis em `glossarios/`, como (nome_do_arquivo, rótulo).
+
+    O rótulo vem do campo "nome" do JSON; sem ele, usa o nome do arquivo. Arquivos
+    inválidos são ignorados (com aviso no log) para um tema quebrado não derrubar a
+    lista inteira. O tema padrão vem primeiro; os demais em ordem alfabética
+    de rótulo.
+    """
+    themes: List[Tuple[str, str]] = []
+    try:
+        arquivos = sorted(os.listdir(GLOSSARIOS_DIR))
+    except OSError:
+        return themes
+    for fname in arquivos:
+        if not fname.endswith(".json"):
+            continue
+        nome_arquivo = os.path.splitext(fname)[0]
+        rotulo = nome_arquivo
+        try:
+            with open(os.path.join(GLOSSARIOS_DIR, fname), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            rotulo = str(data.get("nome") or nome_arquivo)
+        except Exception:
+            log.warning("tema de glossário %s inválido, ignorando na lista", fname)
+            continue
+        themes.append((nome_arquivo, rotulo))
+    themes.sort(key=lambda t: (t[0] != DEFAULT_THEME, t[1]))
+    return themes
+
 
 _TIME_RE = re.compile(r"\b(\d{1,2})\s*([AaPp])\.?[Mm]\.?(?!\w)")
 
@@ -254,7 +299,7 @@ DEFAULT_PROTECT: List[str] = [
 ]
 
 # Tickers expandidos para o nome da empresa (case-SENSITIVE: "COIN" ticker
-# não pode casar com a palavra "coin"). Editável em glossario.json:"tickers".
+# não pode casar com a palavra "coin"). Editável em glossarios/<tema>.json:"tickers".
 DEFAULT_TICKERS: Dict[str, str] = {
     "AAPL": "Apple", "TSLA": "Tesla", "NVDA": "Nvidia", "MSFT": "Microsoft",
     "AMZN": "Amazon", "GOOGL": "Google", "GOOG": "Google", "NFLX": "Netflix",
@@ -889,7 +934,7 @@ DEFAULT_TRANSLATE: Dict[str, str] = {
 }
 
 DEFAULT_FIX: Dict[str, str] = {
-    # ORDEM = glossario.json: o mapa
+    # ORDEM = glossarios/trading.json: o mapa
     # "corrigir" é aplicado por ordem de inserção em fix() - uma chave
     # curta antes de uma longa que a contém como palavra inteira nunca
     # dispara. Editar SEMPRE os dois arquivos juntos e na MESMA ordem
@@ -1556,10 +1601,14 @@ _MAX_AUTO_MASKS = 12
 class Glossary:
     """Blindagem de termos na ida e correções determinísticas na volta."""
 
-    def __init__(self, path: str = "glossario.json") -> None:
+    def __init__(self, path: Optional[str] = None) -> None:
+        path = path or theme_path(DEFAULT_THEME)
+        self.path = path
+        self.name = os.path.splitext(os.path.basename(path))[0]
         protect, fix, translate = DEFAULT_PROTECT, DEFAULT_FIX, DEFAULT_TRANSLATE
         tickers = DEFAULT_TICKERS
         auto = True
+        market = True
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -1569,12 +1618,18 @@ class Glossary:
                 translate = dict(data.get("traduzir", translate))
                 tickers = dict(data.get("tickers", DEFAULT_TICKERS))
                 auto = bool(data.get("auto_proteger_nomes", True))
+                # padrão True: sem o campo (arquivo antigo) ou sem arquivo, o
+                # comportamento continua sendo o de hoje (regras de trading ligadas)
+                market = bool(data.get("regras_de_mercado", True))
                 log.info("glossário: %d protegidos, %d traduções fixas, "
-                         "%d tickers, %d correções, auto-nomes=%s (%s)",
+                         "%d tickers, %d correções, auto-nomes=%s, "
+                         "regras de mercado=%s (%s)",
                          len(protect), len(translate), len(tickers),
-                         len(fix), auto, path)
+                         len(fix), auto, market, path)
             except Exception:
-                log.exception("glossario.json inválido, usando padrão")
+                log.exception("%s inválido, usando padrão", path)
+        else:
+            log.warning("glossário %s não encontrado, usando padrões embutidos", path)
         # proteger => restaura o texto original; traduzir => restaura o pt fixo
         entries: List[Tuple[str, str]] = (
             [(t, "") for t in protect if t.strip()]
@@ -1594,6 +1649,7 @@ class Glossary:
             (re.compile(r"\b" + re.escape(wrong) + r"\b", re.IGNORECASE), right)
             for wrong, right in fix.items()]
         self._auto = auto
+        self._market = market
 
     def mask(self, text: str) -> Tuple[str, List[str]]:
         """Substitui termos por tokens; devolve (texto, restaurações).
@@ -1621,22 +1677,26 @@ class Glossary:
 
             text = regex.sub(_sub, text)
 
-        def _sub_trade(m: re.Match) -> str:
-            found.append(m.group(3).lower())
-            return f"{m.group(1)}{m.group(2)}{_TOKEN.format(len(found) - 1)}"
+        # `_TRADE_NOUN_RE`/`_HILO_RE` são regras de contexto de mercado
+        # financeiro (número/substantivo lidos como jargão de trading); só
+        # rodam quando o tema liga `regras_de_mercado` (ver `__init__`).
+        if self._market:
+            def _sub_trade(m: re.Match) -> str:
+                found.append(m.group(3).lower())
+                return f"{m.group(1)}{m.group(2)}{_TOKEN.format(len(found) - 1)}"
 
-        text = _TRADE_NOUN_RE.sub(_sub_trade, text)
+            text = _TRADE_NOUN_RE.sub(_sub_trade, text)
 
-        # high/low com determinante -> topo/fundo (mesmo esquema do trade: o
-        # determinante fica FORA do token porque é o MT quem concorda o
-        # artigo). O lookahead positivo em `_HILO_RE` evita "a high
-        # probability setup"/"the high side" (high como adjetivo, não topo).
-        def _sub_hilo(m: re.Match) -> str:
-            pt = _HILO_PT[m.group(3).lower()]
-            found.append(pt)
-            return f"{m.group(1)}{m.group(2)}{_TOKEN.format(len(found) - 1)}"
+            # high/low com determinante -> topo/fundo (mesmo esquema do trade: o
+            # determinante fica FORA do token porque é o MT quem concorda o
+            # artigo). O lookahead positivo em `_HILO_RE` evita "a high
+            # probability setup"/"the high side" (high como adjetivo, não topo).
+            def _sub_hilo(m: re.Match) -> str:
+                pt = _HILO_PT[m.group(3).lower()]
+                found.append(pt)
+                return f"{m.group(1)}{m.group(2)}{_TOKEN.format(len(found) - 1)}"
 
-        text = _HILO_RE.sub(_sub_hilo, text)
+            text = _HILO_RE.sub(_sub_hilo, text)
         for regex, name in self._ticker_re:
             def _sub_ticker(match: re.Match, _n: str = name) -> str:
                 found.append(_n)
@@ -1736,6 +1796,21 @@ class Glossary:
         # (mas não "Sexta-feira é quando temos..." -> "está quando")
         text = re.sub(r"\bé (?!quando\b)([a-záéíóúâêôãõç]+ndo)\b", r"está \1", text)
         text = re.sub(r"\bsão (?!quando\b)([a-záéíóúâêôãõç]+ndo)\b", r"estão \1", text)
+        if self._market:
+            text = self._fix_market(text, source)
+        return text
+
+    def _fix_market(self, text: str, source: str) -> str:
+        """Correções de CONTEXTO de mercado financeiro (rede de segurança).
+
+        O Opus-MT comete erros sistemáticos específicos do jargão de trading:
+        lê número solto como idade (preço/nível nunca é idade), confunde
+        nível de preço com temperatura/hora, erra a concordância de gênero
+        dos substantivos de mercado ("um mergulho" -> "um queda"), etc. Essas
+        regras só fazem sentido no domínio de mercado financeiro; temas de
+        outras áreas desligam este método via o campo `regras_de_mercado`
+        (`false`) no JSON do tema (ver `Glossary.__init__`).
+        """
         # O Opus-MT lê número solto como idade ("at 57" -> "aos 57 anos",
         # "about 60" -> "de 60 anos"). No contexto de trade número é
         # preço/região, nunca idade. Só remove o "anos" fantasma quando o

@@ -231,6 +231,7 @@ class ControllerProtocol(Protocol):
     def set_duck_level(self, value: float) -> None: ...      # 0.0-1.0
     def set_tts_speed(self, value: float) -> None: ...      # 1.0/1.25/1.5
     def set_tts_voice(self, name: str) -> None: ...         # id edge-tts (pt-BR-*Neural)
+    def set_glossary(self, name: str) -> None: ...          # tema em glossarios/<name>.json
     def set_capture_device(self, name: str) -> None: ...
     def set_output_device(self, index: int) -> None: ...
     def skip_to_live(self) -> None: ...                      # limpa fila TTS
@@ -245,8 +246,9 @@ class GuiProtocol(Protocol):
     Componentes:
     1. Painel de controle (janela normal): botão Iniciar/Pausar, botão
        "Ao vivo" (skip_to_live), sliders (volume original, volume tradução,
-       nível de ducking), combos de dispositivo (captura/saída), status
-       (idioma detectado, atraso em s, taxa TTS), fonte da legenda +/-.
+       nível de ducking), combo "Tema" (troca o glossário de jargão em uso,
+       arquivos em glossarios/), combos de dispositivo (captura/saída),
+       status (idioma detectado, atraso em s, taxa TTS), fonte da legenda +/-.
     2. Overlay de legenda: janela sem borda (overrideredirect), sempre no
        topo (-topmost), fundo escuro semi-transparente (-alpha ~0.85),
        arrastável com o mouse, botão/atalho para "clique atravessa"

@@ -84,10 +84,62 @@ defesa:
 
 ## 4. Glossário: como funciona e como manter
 
-`glossario.json`, na raiz do projeto, tem quatro listas (`proteger`,
-`tickers`, `traduzir` e `corrigir`) que **substituem** (não somam a) os
-padrões embutidos em `src/tradutor/glossary.py`. Editar os dois arquivos
-juntos e reiniciar o app para recarregar.
+O glossário é organizado por tema: cada arquivo `glossarios/<tema>.json` tem
+quatro listas (`proteger`, `tickers`, `traduzir` e `corrigir`) que
+**substituem** (não somam a) os padrões embutidos em `src/tradutor/glossary.py`,
+que correspondem ao tema `trading` (fallback se o arquivo do tema sumir ou
+ficar corrompido). O app vem com dois temas: `trading` (padrão, jargão de
+mercado financeiro) e `geral` (neutro, sem regras, serve de modelo para
+novos temas). A regra "editar os dois arquivos juntos" (o JSON e os padrões
+embutidos em `glossary.py`) vale só para o tema `trading`; um novo tema não
+mexe em `glossary.py`, só no próprio JSON.
+
+`glossary.py` expõe dois utilitários para lidar com temas:
+
+- `theme_path(name)`: resolve o nome de um tema (ex.: `"geral"`) para o
+  caminho completo do arquivo (`glossarios/geral.json`); usa `os.path.basename`
+  para não permitir escapar do diretório.
+- `list_themes()`: lista `(nome_do_arquivo, rótulo)` de todos os temas
+  válidos em `glossarios/`, lendo o campo `nome` de cada JSON para o rótulo.
+  Arquivos inválidos são ignorados (com aviso no log) em vez de derrubar a
+  lista inteira. O tema padrão (`trading`) sempre vem primeiro; os demais em
+  ordem alfabética pelo rótulo.
+
+O campo booleano `regras_de_mercado` no JSON do tema (lido em
+`Glossary.__init__`, guardado em `self._market`, padrão `True` quando o
+campo não existe, seja porque o arquivo é antigo ou porque o arquivo do tema
+nem existe) liga ou desliga um conjunto de regras fixas de CONTEXTO de
+mercado financeiro que NÃO vêm das quatro listas do JSON, e sim de regexes
+embutidos no código:
+
+- Em `Glossary.mask()`, as substituições `_TRADE_NOUN_RE` ("trade" como
+  substantivo) e `_HILO_RE` ("the high"/"the low" -> topo/fundo) só rodam
+  quando `self._market` é `True`. `_TIME_RE` (hora), as entradas do tema, os
+  tickers e o auto-mask de nomes próprios continuam de fora dessa condição
+  (não são específicos de mercado).
+- Em `Glossary.fix()`, tudo que vem depois do gerúndio (o bloco do "anos
+  fantasma", "aos N", ordinal, "às 900", "graus", "acima/abaixo de", "no N da
+  manhã", "resistência a", eco de número, "mínimo/máximo de", a concordância
+  de artigo `_fem_article`/`_masc_article`, "todos/todas", `_ADJ_NOUN_RE`/
+  `_NOUN_ADJ_RE` e "comércio -> trade") foi extraído para um método privado
+  `_fix_market(text, source)`, chamado por `fix()` só quando `self._market`
+  é `True`. A parte genérica de `fix()` (`_fix_unk`, o laço de `self._fix_re`,
+  o gerúndio e as regras "é/são + gerúndio") continua rodando sempre, porque
+  não é específica de mercado.
+
+`trading.json` tem `regras_de_mercado: true`; `geral.json` tem `false`. Um
+tema novo de outro domínio (medicina, games, futebol) deve copiar `geral.json`
+como ponto de partida e manter o campo em `false`, porque essas regras fixas
+só fazem sentido no domínio de trading (por exemplo, "the high" só deve virar
+"topo" quando o assunto é o preço de um ativo, não em qualquer contexto).
+
+A troca de tema em tempo real (`Pipeline.set_glossary`, chamado pelo combo
+"Tema" da GUI) roda o carregamento do JSON numa thread separada, porque
+compilar as centenas de regexes do glossário leva cerca de 0,1 s e travaria a
+interface. A troca do atributo `self._glossary` é atômica (reatribuição de
+referência em Python), e o estágio de tradução sempre lê `self._glossary` no
+início de cada frase, então a frase em curso termina com o tema antigo e só a
+próxima já usa o novo.
 
 Mecânica de proteção: antes de mandar o texto para o MT, ocorrências dos
 termos protegidos são trocadas por tokens `XPROTECTEDnX` (esse formato
@@ -249,8 +301,8 @@ cenário esperado, não uma exceção.
 ## 10. Convenções de tradução do jargão financeiro
 
 O produto foi afinado para transmissões de trading e análise técnica em
-inglês. Tabela de referência (todas as regras vivem em `glossario.json` e nos
-padrões de `src/tradutor/glossary.py`):
+inglês (tema `trading`). Tabela de referência (todas as regras vivem em
+`glossarios/trading.json` e nos padrões de `src/tradutor/glossary.py`):
 
 | Inglês | Português | Observação |
 |---|---|---|

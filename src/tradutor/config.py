@@ -37,6 +37,7 @@ class AppConfig:
     rate_ladder: list = field(default_factory=lambda: [[2.0, 10], [5.0, 25], [9.0, 40]])
     max_backlog_s: float = 12.0
     gravar_log: bool = False  # true = grava traducoes.log (auditoria de tradução); desligado por padrão
+    glossario: str = "trading"   # tema em glossarios/<nome>.json (combo "Tema" na interface)
     show_subtitles: bool = True
     subtitle_font_size: int = 18
     subtitle_pos: Optional[list] = None
