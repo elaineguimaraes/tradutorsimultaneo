@@ -1,0 +1,41 @@
+# Tradutor Simultâneo: dependências (CPU-only, Python 3.13, Windows 11)
+# Versões pinadas e validadas em Windows 11, Python 3.13.3, CPU (AMD Ryzen 7 5700U), sem GPU.
+# Instalar com:  .venv\Scripts\python.exe -m pip install -r requirements.txt
+
+numpy==2.5.1
+scipy==1.18.0
+
+# --- captura / reprodução ---
+soundcard==0.4.6          # captura WASAPI loopback (all_microphones(include_loopback=True))
+sounddevice==0.5.5        # reprodução (mixer de saída)
+soundfile==0.14.0         # decodifica MP3 nativamente (libsndfile 1.2.2 embutido) -> usado no edge-tts
+                          # NÃO baixar de 0.13: rodas antigas trazem libsndfile < 1.2 e NÃO leem MP3.
+                          # (miniaudio NÃO é necessário, pois soundfile.read() lê o MP3 do edge-tts direto.)
+
+# --- ASR ---
+faster-whisper==1.2.1     # inclui Silero VAD embutido (faster_whisper.vad)
+
+# --- CTranslate2: runtime compartilhado pelo tradutor principal E pela reserva ---
+# Pinado explicitamente para evitar que um resolva uma versão incompatível com o outro.
+ctranslate2==4.8.1
+
+# --- tradução: Opus-MT tc-big en->pt via CTranslate2 (caminho oficial) ---
+# O modelo em si (pasta models/, ~235 MB) não é versionado: é gerado uma única
+# vez pelo instalador (scripts/preparar_modelos.py), que baixa o modelo do
+# Hugging Face e converte para CTranslate2 int8. Estas três dependências
+# suportam esse download/conversão (só usadas na instalação, não em runtime):
+sentencepiece==0.2.2      # tokenização do Opus-MT
+huggingface_hub==1.26.0   # download do modelo Opus-MT
+transformers==5.16.1      # conversão do Opus-MT para CTranslate2
+
+# --- tradução: reserva offline en->pt ---
+# argostranslate 1.11.0 INSTALA E FUNCIONA em Python 3.13 (não houve conflito de pinagem com
+# ctranslate2 4.8.1). Entra em ação automaticamente quando a pasta models/ não existe (instalador
+# não rodou ou falhou). Atenção: arrasta torch/spacy/stanza (~600 MB) por causa do
+# sentence-boundary detection; o torch também é a dependência usada na conversão do Opus-MT acima.
+argostranslate==1.11.0
+
+# --- TTS ---
+# Vozes pt-BR neurais escolhidas na interface: Francisca, Thalita e Antônio.
+edge-tts==7.2.8           # TTS neural pt-BR gratuito (nuvem, sem chave)
+pyttsx3                   # voz OFFLINE reserva (SAPI do Windows, ex. Microsoft Maria pt-BR)

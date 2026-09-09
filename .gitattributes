@@ -1,0 +1,10 @@
+# Normaliza fim de linha: LF no repositório, nativo no checkout.
+* text=auto
+
+# Scripts do Windows precisam de CRLF para o cmd.exe interpretar corretamente.
+*.bat text eol=crlf
+
+# Arquivos binários que podem aparecer em scratch/ ou testes.
+*.wav binary
+*.mp3 binary
+*.png binary
