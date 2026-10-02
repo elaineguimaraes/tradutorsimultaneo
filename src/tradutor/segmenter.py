@@ -76,6 +76,69 @@ def _normalize(text: str) -> str:
     return _WS_RE.sub(" ", text.strip().lower())
 
 
+def _words(text: str) -> List[str]:
+    """Palavras sem pontuação/caixa (vazias descartadas), p/ comparar com o prompt."""
+    return [k for k in (_key(w) for w in _normalize(text).split()) if k]
+
+
+def _ngrams(words: Sequence[str], n: int) -> set:
+    return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
+
+
+_ECHO_MIN_WORDS = 6
+
+
+def _echoes_prompt(text: str, prompt: str) -> bool:
+    """True se o texto é o Whisper regurgitando o prompt (música/silêncio).
+
+    Eco total: >= 6 palavras e o texto é um trecho contíguo do prompt; ou
+    >= 6 palavras com >= 70% dos trigramas presentes no prompt. Abaixo disso
+    é fala legítima que repete o vocabulário ("Calls, puts, gamma.").
+    """
+    tw, pw = _words(text), _words(prompt)
+    if len(tw) < _ECHO_MIN_WORDS or not pw:
+        return False
+    sep = " "
+    if f" {sep.join(tw)} " in f" {sep.join(pw)} ":
+        return True
+    tg = _ngrams(tw, 3)
+    return len(tg & _ngrams(pw, 3)) / len(tg) >= 0.7
+
+
+def _strip_prompt_overlap(text: str, prompt: str, min_words: int = 5) -> str:
+    """Remove do início do texto a cauda do prompt que o Whisper repetiu.
+
+    Eco parcial: o modelo recomeça pelas últimas palavras do trecho anterior
+    ("...three tenths" + "three tenths our last look"). Só age com >= 5
+    palavras coincidentes, para não mutilar repetição natural de fala.
+    """
+    tokens = text.split()
+    tw = [_key(w) for w in tokens]
+    pw = _words(prompt)
+    for k in range(min(len(pw), len(tokens)), min_words - 1, -1):
+        if tw[:k] == pw[-k:] and all(tw[:k]):
+            return " ".join(tokens[k:])
+    return text
+
+
+def _norm_language(language: Optional[str]) -> Optional[str]:
+    """None/""/"auto" -> None (o Whisper detecta); senão o código em minúsculas."""
+    lang = (language or "").strip().lower()
+    return None if lang in ("", "auto") else lang
+
+
+def _prompt_tail(text: str, max_chars: int = 200) -> str:
+    """Últimos ~`max_chars` caracteres do texto, cortados em fronteira de palavra."""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    tail = text[-max_chars:]
+    cut = text[-max_chars - 1]
+    if not cut.isspace():            # caiu no meio de uma palavra: descarta o pedaço
+        _, _, tail = tail.partition(" ")
+    return tail.strip()
+
+
 def is_hallucination(text: str) -> bool:
     """True se o texto for um padrão clássico de alucinação do Whisper."""
     norm = _normalize(text)
@@ -444,6 +507,10 @@ class SpeechSegmenter:
     relógio, e ``t_end - t_start`` é sempre a duração real do PCM.
     """
 
+    #: pausa mínima (s) que faz o corte por max_segment_s esperar: respiro no
+    #: limite dos 7 s, que ou vira fim de frase (silêncio) ou o corte forçado
+    _BREATH_GRACE_S = 0.05
+
     def __init__(self, on_segment: Callable[[SpeechSegment], None],
                  samplerate: int = SR_ASR, silence_ms: int = 600,
                  max_segment_s: float = 12.0, min_speech_ms: int = 250,
@@ -465,6 +532,7 @@ class SpeechSegmenter:
         self._silence = int(sr * self.silence_ms / 1000)
         self._max_seg = int(sr * self.max_segment_s)
         self._valley_win = int(sr * 0.8)
+        self._breath_grace = int(sr * self._BREATH_GRACE_S)
         self._min_vad = max(512, int(sr * 0.5))   # janela mínima p/ rodar o VAD
 
         self._vad, self.vad_backend = build_vad(
@@ -651,8 +719,22 @@ class SpeechSegmenter:
                            voiced=self._last_voice - self._voice_start)
                 self._reset_speech(end)
             elif total - self._speech_start >= self._max_seg:
+                if (silence >= self._breath_grace
+                        and total - self._speech_start
+                        < self._max_seg + self._silence):
+                    # o limite estourou numa pausa (que ainda é menor que
+                    # silence_ms, senão o ramo acima já teria emitido): espera,
+                    # com teto de silence_ms além do limite. Se ela chegar a
+                    # silence_ms, o ramo do silêncio emite como fim de frase;
+                    # se a voz voltar, o próximo tick corta no vale (a pausa) e
+                    # o corte sai marcado como forçado.
+                    self._trim(total)
+                    return
                 cut = self._valley_cut(total)
-                self._emit(self._speech_start, cut)
+                # aqui a pausa é curta (< _BREATH_GRACE_S), não há pausa ou a
+                # espera esgotou o teto: é corte de verdade. Fim de frase por
+                # silêncio sai do ramo acima, com forced_cut=False.
+                self._emit(self._speech_start, cut, forced_cut=True)
                 self._speech_start = cut
                 self._voice_start = cut
                 self._last_voice = max(self._last_voice, cut)
@@ -674,7 +756,8 @@ class SpeechSegmenter:
             return total
         return start + int(np.argmin(db)) * frame
 
-    def _emit(self, start: int, end: int, voiced: Optional[int] = None) -> None:
+    def _emit(self, start: int, end: int, voiced: Optional[int] = None,
+              *, forced_cut: bool = False) -> None:
         start = max(start, self._buf_start)
         end = min(end, self._total)
         n = end - start
@@ -684,7 +767,8 @@ class SpeechSegmenter:
                            1000.0 * useful / self.samplerate)
             return
         pcm = np.array(self._slice(start, end), dtype=np.float32, copy=True)
-        seg = SpeechSegment(pcm=pcm, t_start=self._t(start), t_end=self._t(end))
+        seg = SpeechSegment(pcm=pcm, t_start=self._t(start), t_end=self._t(end),
+                            forced_cut=forced_cut)
         _LOG_VAD.debug("segmento %.2fs (%s)", n / self.samplerate,
                        self.vad_backend)
         try:
@@ -738,7 +822,9 @@ class Transcriber:
                  logprob_threshold: float = -1.0,
                  temperatures: Sequence[float] = (0.0, 0.2, 0.4),
                  compression_ratio_threshold: float = 2.4,
-                 repetition_penalty: float = 1.1) -> None:
+                 repetition_penalty: float = 1.1,
+                 use_context: bool = True,
+                 language: Optional[str] = None) -> None:
         from faster_whisper import WhisperModel  # import tardio (pesado)
 
         self.model_size = model_size
@@ -751,12 +837,50 @@ class Transcriber:
         self.compression_ratio_threshold = float(compression_ratio_threshold)
         self.repetition_penalty = float(repetition_penalty)
 
+        # contexto para o Whisper: vocabulário do tema (hotwords) + final do
+        # trecho anterior (initial_prompt). Pode ser mexido de outras threads.
+        # False = Whisper às cegas (sem hotwords, sem prompt, sem guarda de eco)
+        self.use_context = bool(use_context)
+        # idioma fixo do áudio; None/"auto" = o Whisper detecta a cada segmento
+        self.language = _norm_language(language)
+        self._ctx_lock = threading.Lock()
+        self._vocabulary = ""
+        self._prev_text = ""
+        self._prev_t_end = 0.0
+        self._prev_lang = ""
+
         t0 = time.monotonic()
         self._model = WhisperModel(
             model_size, device=device, compute_type=compute_type,
             cpu_threads=cpu_threads, num_workers=num_workers)
         _LOG_ASR.info("modelo whisper '%s' carregado (%s/%s) em %.1fs",
                       model_size, device, compute_type, time.monotonic() - t0)
+
+    #: fala contínua: lacuna máxima (s) entre o fim do trecho anterior e o início
+    #: deste para o texto anterior valer como contexto (corte forçado tem ~0)
+    _CONTEXT_GAP_S = 3.0
+
+    def set_vocabulary(self, text: str) -> None:
+        """Define as hotwords (termos do tema que o Whisper costuma errar)."""
+        with self._ctx_lock:
+            self._vocabulary = (text or "").strip()
+
+    def reset_context(self) -> None:
+        """Esquece o texto anterior (parada/reinício: não vazar contexto velho)."""
+        with self._ctx_lock:
+            self._prev_text = ""
+            self._prev_t_end = 0.0
+            self._prev_lang = ""
+
+    def _context_for(self, segment: SpeechSegment) -> Tuple[str, str]:
+        """(hotwords, initial_prompt) para o segmento; vazios sem contexto."""
+        if not self.use_context:
+            return "", ""
+        with self._ctx_lock:
+            prev_ok = (bool(self._prev_text) and self._prev_lang == "en"
+                       and segment.t_start - self._prev_t_end <= self._CONTEXT_GAP_S)
+            prompt = _prompt_tail(self._prev_text) if prev_ok else ""
+            return self._vocabulary, prompt
 
     def transcribe(self, segment: SpeechSegment) -> Optional[Transcript]:
         """Transcreve um segmento; ``None`` se não houver fala útil."""
@@ -766,11 +890,16 @@ class Transcriber:
         if len(pcm) == 0:
             return None
 
+        vocab, prompt = self._context_for(segment)
+        guard = f"{vocab} {prompt}".strip()   # o que o Whisper pode regurgitar
+
         t0 = time.monotonic()
         try:
             segments, info = self._model.transcribe(
                 pcm,
-                language=None,
+                hotwords=vocab or None,
+                initial_prompt=prompt or None,
+                language=self.language,
                 beam_size=self.beam_size,
                 vad_filter=False,
                 condition_on_previous_text=False,
@@ -815,9 +944,25 @@ class Transcriber:
             _LOG_ASR.info("descartado: alucinação | %r", text[:60])
             return None
 
+        if guard:
+            stripped = _strip_prompt_overlap(text, prompt) if prompt else text
+            if _echoes_prompt(text, guard) or not stripped.strip():
+                _LOG_ASR.info("descartado: eco do prompt | %r", text[:60])
+                self.reset_context()   # rompe qualquer laço de eco
+                return None
+            if stripped != text:
+                _LOG_ASR.info("eco parcial do contexto removido | %r", text[:60])
+                text = stripped.strip()
+
+        with self._ctx_lock:
+            self._prev_text = text
+            self._prev_t_end = segment.t_end
+            self._prev_lang = lang
+
         _LOG_ASR.info("asr lang=%s (%.2f) | áudio %.2fs | proc %.2fs "
-                      "(rtf %.2f) | %s", lang, lang_prob, dur, elapsed,
-                      elapsed / dur if dur else 0.0, text[:120])
+                      "(rtf %.2f) | %s%s", lang, lang_prob, dur, elapsed,
+                      elapsed / dur if dur else 0.0, text[:120],
+                      " | corte" if segment.forced_cut else "")
         return Transcript(text=text, lang=lang, lang_prob=lang_prob,
                           segment=segment)
 

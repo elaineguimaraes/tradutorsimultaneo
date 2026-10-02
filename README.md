@@ -207,7 +207,8 @@ A escolha do tema é feita pelo combo **Tema** no painel ou pela chave
 partir da próxima frase; antes do primeiro Iniciar, vale quando o app iniciar.
 
 Cada arquivo de tema tem os campos `nome` e `descricao` (usados no combo da
-interface), o booleano `regras_de_mercado` e quatro listas:
+interface), o booleano `regras_de_mercado`, a lista opcional `vocabulario_asr`
+e quatro listas:
 
 | Lista | Efeito |
 |---|---|
@@ -215,6 +216,11 @@ interface), o booleano `regras_de_mercado` e quatro listas:
 | `tickers` | símbolos de bolsa expandidos para o nome da empresa na fala (AAPL → Apple) |
 | `traduzir` | traduções fixas aplicadas antes de o texto chegar ao modelo de tradução |
 | `corrigir` | substituições aplicadas na saída em português, depois da tradução |
+
+`vocabulario_asr` (opcional, até ~300 caracteres no total) traz nomes e siglas
+que o reconhecimento de fala costuma errar sem contexto (Nasdaq, Nvidia,
+FOMC). Eles são passados ao Whisper como dica de vocabulário e não afetam a
+tradução. Pode ficar vazia (`[]`).
 
 **As listas do arquivo substituem (não somam a) os padrões embutidos** em
 `src/tradutor/glossary.py` (que correspondem ao tema `trading`). Se você
@@ -285,8 +291,13 @@ versionado**, porque guarda estado específico da máquina onde o app roda
 | `whisper_model` | `"base"` | modelo do faster-whisper usado na transcrição |
 | `tts_voice` | `"pt-BR-FranciscaNeural"` | voz do Edge-TTS |
 | `tts_speed` | `1.0` | velocidade base da voz (1,0 / 1,25 / 1,5) |
+| `idioma_origem` | `"en"` | idioma do áudio (`"en"`, `"es"`…); `"auto"` deixa o Whisper detectar a cada segmento |
 | `silence_ms` | `450` | silêncio (ms) que fecha um segmento de fala no VAD |
-| `max_segment_s` | `7.0` | duração máxima (s) de um segmento antes de ser cortado |
+| `max_segment_s` | `5.0` | duração máxima (s) de um segmento antes de ser cortado |
+| `juntar_frases` | `true` | frase cortada por `max_segment_s` espera o resto antes de traduzir |
+| `max_espera_frase_s` | `10.0` | tempo máximo (s) segurando a cauda de uma frase sem continuação |
+| `max_palavras_espera` | `8` | maior pedaço de frase (em palavras) que fica esperando a continuação; pedaços maiores são traduzidos na hora. Menor = menos silêncio; `20` = comportamento antigo |
+| `contexto_asr` | `true` | o Whisper recebe o vocabulário do tema e o final do trecho anterior como contexto |
 | `rate_ladder` | `[[2.0, 10], [5.0, 25], [9.0, 40]]` | escada de atraso (s) → aceleração da voz (%) |
 | `max_backlog_s` | `12.0` | atraso acumulado (s) acima do qual o app pula para o ao vivo |
 | `gravar_log` | `false` | `true` grava `traducoes.log` com as 4 etapas de cada frase (auditoria de tradução) |

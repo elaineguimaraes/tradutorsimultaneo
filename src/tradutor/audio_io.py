@@ -473,8 +473,14 @@ class OutputMixer:
         if dropped:
             log.debug("passthrough: %d quadros antigos descartados", dropped)
 
-    def enqueue_tts(self, pcm: np.ndarray) -> None:
-        """Enfileira uma fala traduzida (mono float32, taxa do mixer)."""
+    def enqueue_tts(self, pcm: np.ndarray, *, fade_in: bool = True,
+                    fade_out: bool = True) -> None:
+        """Enfileira uma fala traduzida (mono float32, taxa do mixer).
+
+        Fala em streaming chega em trechos: só o 1º leva fade de entrada e só
+        o último leva fade de saída (`fade_in`/`fade_out`), senão cada junta
+        abriria um vale de silêncio no meio da frase.
+        """
         arr = np.asarray(pcm, dtype=np.float32).reshape(-1)
         if arr.size == 0:
             return
@@ -483,8 +489,10 @@ class OutputMixer:
         n = min(int(_TTS_EDGE_FADE_SECONDS * self.samplerate), arr.size // 2)
         if n > 1:
             ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
-            arr[:n] *= ramp
-            arr[-n:] *= ramp[::-1]
+            if fade_in:
+                arr[:n] *= ramp
+            if fade_out:
+                arr[-n:] *= ramp[::-1]
         with self._lock:
             self._tts.append(arr)
             self._tts_remaining += arr.size

@@ -41,6 +41,9 @@ class SpeechSegment:
     pcm: np.ndarray          # float32 mono @ SR_ASR
     t_start: float           # time.monotonic() do início da fala
     t_end: float             # time.monotonic() do fim da fala
+    # True = cortado por max_segment_s (a frase pode continuar no próximo
+    # segmento); False = fim por silêncio (pausa real) ou flush
+    forced_cut: bool = False
 
 
 @dataclass
@@ -139,6 +142,8 @@ class SpeechSegmenterProtocol(Protocol):
     - Emite SpeechSegment quando: (a) detectou fim de fala (silence_ms de
       silêncio após fala) ou (b) a fala corrente atingiu max_segment_s
       (corta no melhor vale de energia recente para não partir palavra).
+      O corte por max_segment_s sai com SpeechSegment.forced_cut=True, para a
+      integração re-juntar a frase partida antes de traduzir.
     - Usa o Silero VAD embutido no pacote faster_whisper (ver
       scratch/env_report.md para a API exata da versão instalada); fallback
       para VAD de energia RMS com histerese se o import falhar.

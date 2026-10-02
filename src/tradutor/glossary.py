@@ -196,6 +196,37 @@ def _fem_article(m: "re.Match") -> str:
     return f"{art} {m.group(2)}"
 
 
+# Artigo/numeral que o MT deixou no masculino diante de um termo restaurado
+# feminino ("meu avaliações", "dois contas financiadas"): concorda em gênero E
+# número com o substantivo (a máscara restaura o termo já flexionado).
+_FEM_NUM = {"um": ("uma", "umas"), "uns": ("uma", "umas"),
+            "dois": ("duas", "duas"),
+            "o": ("a", "as"), "os": ("a", "as"),
+            "meu": ("minha", "minhas"), "meus": ("minha", "minhas"),
+            "seu": ("sua", "suas"), "seus": ("sua", "suas"),
+            "nosso": ("nossa", "nossas"), "nossos": ("nossa", "nossas"),
+            "este": ("esta", "estas"), "estes": ("esta", "estas"),
+            "esse": ("essa", "essas"), "esses": ("essa", "essas"),
+            "aquele": ("aquela", "aquelas"), "aqueles": ("aquela", "aquelas"),
+            "todos": ("toda", "todas")}
+
+# "contas" só quando é a conta de trading ("contas financiadas", "conta de
+# avaliação"): "o conta" também é pronome + verbo em português legítimo.
+_FEM_NOUN_RE = re.compile(
+    r"\b(um|uns|dois|os?|meus?|seus?|nossos?|estes?|esses?|aqueles?|todos)"
+    r" (avaliaç(?:ão|ões)|contas?(?= (?:financiad|de avaliaç)))",
+    re.IGNORECASE)
+
+
+def _fem_by_number(m: "re.Match") -> str:
+    art, noun = m.group(1), m.group(2)
+    sing, plur = _FEM_NUM[art.lower()]
+    new = plur if noun.lower().endswith("s") else sing
+    if art[0].isupper():
+        new = new[0].upper() + new[1:]
+    return f"{new} {noun}"
+
+
 # Sentido inverso ("a baixa noturna" -> "a fundo da noite"). O artigo "a"
 # solto fica DE FORA: "analisar a fundo" é português legítimo e viraria
 # "analisar o fundo".
@@ -267,6 +298,7 @@ def _agree_adj_noun(m: "re.Match") -> str:
 
 
 DEFAULT_PROTECT: List[str] = [
+    "Tasty Live", "Tastylive", "Tastytrade", "Tasty Trade",
     "Federal Reserve", "Fed chair", "Fed", "FOMC", "Treasuries",
     "Nasdaq", "Dow Jones", "S&P 500", "S&P", "Wall Street",
     "Jerome Powell", "Powell",
@@ -770,11 +802,109 @@ DEFAULT_TRANSLATE: Dict[str, str] = {
     "best stock": "melhor ação",
     "the stocks": "as ações",
     # gap (NÃO usar "preenchimento" - a regra "preenchimento"->"execução" mutila)
-    "gap fill": "fechamento do gap",
-    "gap fills": "fechamentos do gap",
-    "fill the gap": "fechar o gap",
+    "down side gap filled": "gap abaixo fechado",
+    "downside gap filled": "gap abaixo fechado",
+    "down side gap fills": "fechamentos de gap abaixo",
+    "down side gap-fills": "fechamentos de gap abaixo",
+    "downside gap fills": "fechamentos de gap abaixo",
+    "downside gap-fills": "fechamentos de gap abaixo",
+    "down side gap fill": "fechamento de gap abaixo",
+    "down side gapfills": "fechamentos de gap abaixo",
+    "down side gap-fill": "fechamento de gap abaixo",
+    "up side gap filled": "gap acima fechado",
+    "downside gap fill": "fechamento de gap abaixo",
+    "downside gapfills": "fechamentos de gap abaixo",
+    "downside gap-fill": "fechamento de gap abaixo",
+    "down side gapfill": "fechamento de gap abaixo",
+    "upside gap filled": "gap acima fechado",
+    "up side gap fills": "fechamentos de gap acima",
+    "up side gap-fills": "fechamentos de gap acima",
+    "downside gapfill": "fechamento de gap abaixo",
+    "upside gap fills": "fechamentos de gap acima",
+    "upside gap-fills": "fechamentos de gap acima",
+    "up side gap fill": "fechamento de gap acima",
+    "up side gapfills": "fechamentos de gap acima",
+    "up side gap-fill": "fechamento de gap acima",
+    "upside gap fill": "fechamento de gap acima",
+    "upside gapfills": "fechamentos de gap acima",
+    "upside gap-fill": "fechamento de gap acima",
+    "up side gapfill": "fechamento de gap acima",
+    "filling the gap": "fechando o gap",
+    "upside gapfill": "fechamento de gap acima",
+    "gap was filled": "gap foi fechado",
     "filled the gap": "fechou o gap",
+    "gap is filled": "gap está fechado",
     "fills the gap": "fecha o gap",
+    "fill the gap": "fechar o gap",
+    "gap filled": "gap fechado",
+    "gap got filled": "gap foi fechado",
+    "gap gets filled": "gap é fechado",
+    "gap has been filled": "gap foi fechado",
+    "gap getting filled": "gap sendo fechado",
+    "free trial": "teste grátis",
+    "the free trial": "o teste grátis",
+    "trial period": "período de teste",
+    "churning through accounts": "queimando contas",
+    "churning accounts": "queimando contas",
+    "were churning accounts": "estavam queimando contas",
+    "are churning accounts": "estão queimando contas",
+    "evals": "avaliações",
+    "eval": "avaliação",
+    "evaluation account": "conta de avaliação",
+    "evaluation accounts": "contas de avaliação",
+    "funded account": "conta financiada",
+    "funded accounts": "contas financiadas",
+    "my funded account": "minha conta financiada",
+    "funded options account": "conta financiada de opções",
+    "funded futures account": "conta financiada de futuros",
+    "my evals": "minhas avaliações",
+    "my eval": "minha avaliação",
+    "an eval": "uma avaliação",
+    "your evals": "suas avaliações",
+    "your eval": "sua avaliação",
+    "my funded accounts": "minhas contas financiadas",
+    "your funded account": "sua conta financiada",
+    "your funded accounts": "suas contas financiadas",
+    "two funded accounts": "duas contas financiadas",
+    "my e-vows": "minhas avaliações",
+    "my e-vals": "minhas avaliações",
+    "my e-vails": "minhas avaliações",
+    "my e-vow": "minha avaliação",
+    "my e-val": "minha avaliação",
+    "my e-vail": "minha avaliação",
+    "an e-vow": "uma avaliação",
+    "an e-val": "uma avaliação",
+    "an e-vail": "uma avaliação",
+    "e vows": "avaliações",
+    "e vals": "avaliações",
+    "e vails": "avaliações",
+    "e vow": "avaliação",
+    "e val": "avaliação",
+    "e vail": "avaliação",
+    "my e vows": "minhas avaliações",
+    "my e vals": "minhas avaliações",
+    "my e vow": "minha avaliação",
+    "my e val": "minha avaliação",
+    "e-vals": "avaliações",
+    "e-vails": "avaliações",
+    "evails": "avaliações",
+    "e-vows": "avaliações",
+    "e-val": "avaliação",
+    "e-vail": "avaliação",
+    "e-vow": "avaliação",
+    "churn through accounts": "queimar contas",
+    "copy app": "app de copy trade",
+    "copy trading": "copy trade",
+    "have you traded": "você já operou",
+    "did you trade": "você operou",
+    "my play": "minha jogada",
+    "your play": "sua jogada",
+    "gap fills": "fechamentos de gap",
+    "gap-fills": "fechamentos de gap",
+    "gap fill": "fechamento de gap",
+    "gapfills": "fechamentos de gap",
+    "gap-fill": "fechamento de gap",
+    "gapfill": "fechamento de gap",
     "gap up": "gap de alta",
     "gap down": "gap de baixa",
     "upside gap": "gap de alta",
@@ -1570,7 +1700,7 @@ _QLOG.setLevel(logging.INFO)  # independe da configuração do logger raiz
 
 # Liga/desliga a gravação de traducoes.log (config.json: "gravar_log").
 # Desligado, apply() nem monta a mensagem: custo zero.
-_QLOG_ENABLED = True
+_QLOG_ENABLED = False   # só o app liga (config `gravar_log`); testes nunca escrevem no log
 
 
 def set_quality_log(enabled: bool) -> None:
@@ -1609,6 +1739,7 @@ class Glossary:
         tickers = DEFAULT_TICKERS
         auto = True
         market = True
+        vocab: List[str] = []
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -1621,6 +1752,10 @@ class Glossary:
                 # padrão True: sem o campo (arquivo antigo) ou sem arquivo, o
                 # comportamento continua sendo o de hoje (regras de trading ligadas)
                 market = bool(data.get("regras_de_mercado", True))
+                # termos que o Whisper erra sem contexto (Nasdaq -> "Nasak");
+                # vão como dica de vocabulário para o ASR, não para o MT
+                vocab = [str(t).strip() for t in data.get("vocabulario_asr", [])
+                         if str(t).strip()]
                 log.info("glossário: %d protegidos, %d traduções fixas, "
                          "%d tickers, %d correções, auto-nomes=%s, "
                          "regras de mercado=%s (%s)",
@@ -1650,6 +1785,20 @@ class Glossary:
             for wrong, right in fix.items()]
         self._auto = auto
         self._market = market
+        self._asr_vocab = vocab
+
+    _ASR_VOCAB_MAX = 300
+
+    @property
+    def asr_vocabulary(self) -> str:
+        """Vocabulário do tema para o Whisper ("a, b, c"), até 300 caracteres."""
+        out = ""
+        for term in self._asr_vocab:
+            nxt = f"{out}, {term}" if out else term
+            if len(nxt) > self._ASR_VOCAB_MAX:
+                break
+            out = nxt
+        return out
 
     def mask(self, text: str) -> Tuple[str, List[str]]:
         """Substitui termos por tokens; devolve (texto, restaurações).
@@ -1858,6 +2007,7 @@ class Glossary:
             r"|reaç(?:ão|ões)|teleconferências?|temporadas?|execuç(?:ão|ões)"
             r"|calls|puts|aç(?:ão|ões))\b",
             _fem_article, text)
+        text = _FEM_NOUN_RE.sub(_fem_by_number, text)
         text = re.sub(
             r"\b([Uu]mas?|[Aa]s|[Ee]stas?|[Ee]ssas?|[Aa]quelas?|[Mm]inhas?|[Ss]uas?"
             r"|[Nn]ossas?|[Tt]odas)"

@@ -22,6 +22,7 @@ import asyncio
 import io
 import logging
 import os
+import queue
 import re
 import threading
 import time
@@ -55,30 +56,224 @@ _DOUBLED_WORD_RE = re.compile(
     r"(?i)^(\W*)(\w+)[,;]?\s+\2(\W*)$")
 
 
+# Conectores onde uma frase longa sem pontuação pode ser partida (2ª opção,
+# depois da vírgula). Sem eles o Marian recebe 30 palavras de uma vez e cai
+# em loop de paráfrase.
+_SOFT_CONNECTORS = frozenset(
+    {"so", "but", "because", "if", "which", "when", "while", "and"})
+_SOFT_MIN_WORDS = 4   # nunca gera pedaço menor que isto
+
+
+def _soft_split(words: "list[str]", max_words: int) -> "list[list[str]]":
+    """Parte a lista de palavras perto do meio, vírgula antes de conector."""
+    n = len(words)
+    if n <= max_words:
+        return [words]
+    for tier in (0, 1):
+        best = None
+        for k in range(_SOFT_MIN_WORDS, n - _SOFT_MIN_WORDS + 1):
+            if tier == 0:
+                ok = words[k - 1].endswith(",")
+            else:
+                ok = words[k].lower().strip(",.;:!?") in _SOFT_CONNECTORS
+            if ok and (best is None or abs(k - n / 2) < abs(best - n / 2)):
+                best = k
+        if best is not None:
+            return (_soft_split(words[:best], max_words)
+                    + _soft_split(words[best:], max_words))
+    return [words]   # sem fronteira que renda 2 pedaços de >= 4 palavras
+
+
 def _chunk_long(sent: str, max_words: int = 22) -> "list[str]":
-    """Sentença longa (ASR sem pontuação) faz o Marian ecoar; divide."""
-    if len(sent.split()) <= max_words:
+    """Frase longa (ASR sem pontuação) faz o Marian ecoar; divide em pedaços.
+
+    Devolve os pedaços sem a vírgula final (o MT a trocaria por ponto); quem
+    reagrupa a saída sabe que todos, menos o último, são continuação.
+    """
+    pieces = _soft_split(sent.split(), max_words)
+    if len(pieces) == 1:
         return [sent]
-    parts = re.split(r"(?<=,)\s+", sent)
-    chunks, cur, cnt = [], [], 0
-    for part in parts:
-        n = len(part.split())
-        if cur and cnt + n > max_words:
-            chunks.append(" ".join(cur))
-            cur, cnt = [], 0
-        cur.append(part)
-        cnt += n
-    if cur:
-        chunks.append(" ".join(cur))
-    final = []
-    for c in chunks:
-        cw = c.split()
-        while len(cw) > max_words + 6:   # bloco sem vírgula: corte seco
-            final.append(" ".join(cw[:max_words]))
-            cw = cw[max_words:]
-        if cw:
-            final.append(" ".join(cw))
-    return final or [sent]
+    return [" ".join(p).rstrip(",;") for p in pieces]
+
+
+_I_START_RE = re.compile(r"I(?:'(?:m|ve|ll|d))?\b")
+
+
+def _join_pieces(outs: "list[str]", srcs: "list[str]", soft: "list[bool]") -> str:
+    """Reagrupa a saída: pedaço de continuação termina em vírgula, não ponto."""
+    res = []
+    prev_cont = False
+    for out, src, cont in zip(outs, srcs, soft):
+        out = out.strip()
+        if not out:
+            continue
+        # origem em minúscula no meio da frase = não é nome próprio: o MT
+        # capitalizou por achar que abria frase
+        # (EUA/SPY ficam: 2ª letra maiúscula; "E"/"É" de uma letra descem)
+        if (prev_cont and (src[:1].islower() or _I_START_RE.match(src))
+                and out[0].isupper() and (len(out) == 1 or not out[1].isupper())):
+            out = out[0].lower() + out[1:]
+        if cont:
+            out = out.rstrip(" .,;!?") + ","
+        prev_cont = cont
+        res.append(out)
+    # último pedaço traduziu para vazio: não deixa a vírgula pendurada
+    if res and outs and not outs[-1].strip():
+        res[-1] = res[-1].rstrip(",")
+    return " ".join(res)
+
+
+_ADJ_DUP_RE = re.compile(r"(?i)\b(\w+)[,;]?\s+\1\b")
+_WORD_RE = re.compile(r"\w+")
+_PT_TRAIL_CONN = frozenset(
+    "e ou mas que de do da dos das em no na a o os as um uma com para por se "
+    "como então".split())
+
+
+_EN_STOP = frozenset(
+    "the a an and or but so to of in on at for with from by as that this "
+    "these those it its is are was were be been we you they he she i there "
+    "which what when where who how if because then than not no up down "
+    "out off do did does have has had".split())
+
+
+# gagueira do ASR que não conta como repetição: só artigos/preposições
+# ("No, no" é ênfase legítima e vira "Não, não")
+_EN_STUTTER = frozenset("the a an to of in on at".split())
+
+
+def _src_has_adjacent_dup(en: str) -> bool:
+    """Repetição de palavra no inglês; gagueira de artigo/preposição não conta."""
+    return any(m.group(1).lower() not in _EN_STUTTER
+               for m in _ADJ_DUP_RE.finditer(en))
+
+
+def _src_repeats_content_word(en: str) -> bool:
+    """O inglês repete alguma palavra de conteúdo (>= 3 letras, não stopword)?
+
+    Frase com ênfase/paralelismo ("above average ... above average", "if price
+    goes... if price falls") vira, em português, um trecho de 3+ palavras que
+    se repete legitimamente; nesse caso a poda de frase não pode agir.
+    """
+    seen = set()
+    for w in (x.lower() for x in _WORD_RE.findall(en)):
+        if len(w) < 3 or w in _EN_STOP:
+            continue
+        if w in seen:
+            return True
+        seen.add(w)
+    return False
+
+
+def _src_has_repeated_3gram(en: str) -> bool:
+    w = [x.lower() for x in _WORD_RE.findall(en)]
+    grams = [tuple(w[i:i + 3]) for i in range(len(w) - 2)]
+    return len(grams) != len(set(grams))
+
+
+def _first_repeated_span(pt: str) -> "int | None":
+    """Posição (char) do início da 2ª ocorrência do maior trecho repetido (>= 3 palavras)."""
+    ms = list(_WORD_RE.finditer(pt))
+    keys = [m.group().lower() for m in ms]
+    for n in range(len(keys) // 2, 2, -1):
+        for a in range(len(keys) - 2 * n + 1):
+            span = keys[a:a + n]
+            if not any(len(w) >= 3 for w in span):
+                continue
+            for b in range(a + n, len(keys) - n + 1):
+                if keys[b:b + n] == span:
+                    return ms[b].start()
+    return None
+
+
+def _dedupe_echo(pt: str, en: str) -> "tuple[str, bool]":
+    """Remove eco do MT que NÃO existe no inglês de origem (por pedaço).
+
+    O Marian repete palavra ("Nike Nike") e trecho ("...da Piper, você tem
+    que ficar na camisa da Piper") sem que o falante tenha dito isso. Se o
+    inglês repete (ênfase real: "really, really"), a tradução é preservada.
+    """
+    out = pt
+    if not _src_has_repeated_3gram(en) and not _src_repeats_content_word(en):
+        pos = _first_repeated_span(out)
+        if pos is not None:
+            cut = out[:pos].rstrip(" ,;:-")
+            if "," in cut:
+                head, _, tail = cut.rpartition(",")
+                if head.strip() and len(tail.split()) <= 3:
+                    cut = head
+            words = cut.split()
+            while len(words) > 3 and words[-1].lower().strip(",;") in _PT_TRAIL_CONN:
+                words.pop()
+            cut = " ".join(words).rstrip(" ,;:-")
+            if cut:
+                end = out.rstrip()[-1:]
+                out = cut + (end if end in ".!?" else "")
+    if not _src_has_adjacent_dup(en):
+        prev = None
+        while prev != out:
+            prev = out
+            out = _ADJ_DUP_RE.sub(r"\1", out)
+    if not _src_repeats_content_word(en):
+        # "assine e assine" (EN "just sign up"): palavra repetida com conector.
+        # O inglês de "mais e mais"/"dia após dia"/"passo a passo" repete a
+        # palavra (ou a liga por and/by/after/to), por isso o guarda.
+        if not _EN_LINKED_DUP_RE.search(en):
+            out = _CONN_DUP_RE.sub(_keep_first, out)
+        # "aqui mesmo aqui" no fim da frase: 2ª ocorrência é eco
+        if not _EN_LINKED_DUP_RE.search(en):
+            out = _TAIL_DUP_RE.sub(_keep_before_tail, out)
+    out = _fix_number_echo(out, en)
+    return out, out != pt
+
+
+_CONN_DUP_RE = re.compile(r"(?i)\b(\w{3,})\s+(?:e|ou)\s+\1\b")
+_TAIL_DUP_RE = re.compile(r"(?i)\b(\w{3,})((?:[ ,]+\w+){1,2})[ ,]+\1\b(?=\W*$)")
+_EN_LINKED_DUP_RE = re.compile(
+    r"(?i)\b(\w+)\s+(?:and|or|by|to|after|on|over|upon|in|for)\s+\1\b")
+_PT_STOP = frozenset(
+    "que com para por uma uns umas dos das nos nas não sim mais como mas "
+    "seu sua isso esse essa este esta ele ela são foi ser ter tem".split())
+
+
+_PT_LINK = frozenset({"e", "ou", "a", "por", "após", "apos", "para", "de"})
+
+
+def _keep_first(m: "re.Match") -> str:
+    return m.group(1)
+
+
+def _keep_before_tail(m: "re.Match") -> str:
+    """Descarta a repetição final, exceto se a palavra for função em português."""
+    if m.group(1).lower() in _PT_STOP:
+        return m.group(0)
+    # "subindo e subindo", "lado a lado": o miolo é só um conector, forma da regra (a)
+    if m.group(2).replace(",", " ").strip().lower() in _PT_LINK:
+        return m.group(0)
+    return m.group(1) + m.group(2)
+
+
+_NUM_RE = re.compile(r"\d[\d.,]*\d|\d")
+
+
+def _fix_number_echo(pt: str, en: str) -> str:
+    """"400" -> "400.400": número do MT que é o do inglês concatenado consigo."""
+    # os tokens XPROTECTEDnX do inglês mascarado não são números
+    nums = set(_NUM_RE.findall(re.sub(r"(?i)XPROTECTED\d+X", " ", en)))
+    if not nums:
+        return pt
+
+    def _sub(m: "re.Match") -> str:
+        p = m.group(0)
+        # o MT localiza "1.1" -> "1,1": a forma com o outro separador é a mesma
+        if p in nums or p.replace(",", ".") in nums or p.replace(".", ",") in nums:
+            return p
+        for n in nums:
+            if len(n) >= 2 and len(p) > len(n) and any(p == n + sep + n for sep in ("", ".", ",")):
+                return n
+        return p
+
+    return _NUM_RE.sub(_sub, pt)
 
 
 def _dedupe_adjacent_sentences(text: str) -> "tuple[str, bool]":
@@ -418,7 +613,12 @@ class Translator:
         # Traduzir cada frase separadamente (em lote, mesma chamada) reduz
         # muito os ecos e ainda melhora a qualidade.
         sents = [s for s in _SENT_RE.split(text) if s.strip()] or [text]
-        sents = [c for s in sents for c in _chunk_long(s)]
+        srcs, soft = [], []
+        for s in sents:
+            parts = _chunk_long(s)
+            srcs.extend(parts)
+            soft.extend([True] * (len(parts) - 1) + [False])
+        sents = srcs
         batch = [[self._CT2_TARGET_TOKEN] + c["sp_src"].encode(s, out_type=str)
                  for s in sents]
         # repetition_penalty segura os loops do Marian sem mutilar os tokens
@@ -432,13 +632,18 @@ class Translator:
             max_decoding_length=max(24, int(1.6 * max(len(b) for b in batch)) + 8))
         sp = c["sp_tgt"] or c["sp_src"]
         outs = []
-        for r in res:
+        for r, src in zip(res, srcs):
             hyp = r.hypotheses[0]
             try:
-                outs.append(sp.decode(hyp))
+                o = sp.decode(hyp)
             except Exception:
-                outs.append("".join(hyp).replace("▁", " ").strip())
-        return " ".join(o for o in outs if o.strip())
+                o = "".join(hyp).replace("▁", " ").strip()
+            # eco que não existe no inglês deste pedaço (comparado por pedaço)
+            o, ecoou = _dedupe_echo(o, src)
+            if ecoou:
+                log_mt.info("eco da tradução removido | %r", o[:100])
+            outs.append(o)
+        return _join_pieces(outs, srcs, soft)
 
     # ---------------------------------------------------------- tradução ---
 
@@ -493,6 +698,9 @@ class Translator:
                     self._failed_langs.add(lang)
                     return text
                 out = tr.translate(text)
+                out, ecoou = _dedupe_echo(out, text)
+                if ecoou:
+                    log_mt.info("eco da tradução removido | %r", out[:100])
             else:
                 out = self._ct2_translate(text)
             # rede de segurança contra loop do PRÓPRIO tradutor (o Marian
@@ -550,6 +758,93 @@ def _decode_audio(data: bytes) -> tuple[np.ndarray, int, str]:
     return np.ascontiguousarray(arr, dtype=np.float32), int(dec.sample_rate), "miniaudio"
 
 
+#: marcador de fim devolvido por `TtsJob.get()`
+JOB_END = object()
+
+
+class TtsJob:
+    """Uma frase em síntese: fila thread-safe de trechos de PCM em ordem.
+
+    O produtor (thread do pool, via `TtsSpeaker.synth_stream`) chama
+    `put_chunk()` e por fim `finish()`; o consumidor (thread de TTS do
+    pipeline) lê com `get()` e toca os trechos conforme chegam, enquanto o
+    próximo job já sintetiza em paralelo. `cancel()` abandona o job (parada,
+    fila cheia): o produtor para de empurrar e o consumidor acorda.
+    """
+
+    def __init__(self, source: Optional[Translation] = None) -> None:
+        self.source = source
+        self.rate = 0                       # aceleração (%) escolhida p/ esta frase
+        self.cancelled = threading.Event()
+        self.failed = False                 # terminou por falha no meio do stream
+        self.samples = 0                    # amostras já produzidas
+        self.samplerate = 0
+        self.t_first: Optional[float] = None   # monotonic do 1º trecho
+        self._q: "queue.Queue" = queue.Queue()
+        self._lock = threading.Lock()
+        self._closed = False
+        self._attempt = 0
+
+    def new_attempt(self) -> int:
+        """Abre uma tentativa de síntese; as anteriores passam a ser obsoletas.
+
+        Sem isto, a tentativa 1 (abandonada por timeout) podia empurrar o seu
+        1º trecho depois de a tentativa 2 já ter começado: a frase tocava
+        repetida. `put_chunk(attempt=id)` descarta o que vier de id velho.
+        """
+        with self._lock:
+            self._attempt += 1
+            return self._attempt
+
+    def is_current(self, attempt: int) -> bool:
+        return attempt == self._attempt
+
+    def put_chunk(self, pcm: np.ndarray, samplerate: int, last: bool = False,
+                  attempt: Optional[int] = None) -> None:
+        arr = np.ascontiguousarray(np.asarray(pcm, dtype=np.float32).reshape(-1))
+        with self._lock:
+            if self._closed or self.cancelled.is_set():
+                return
+            if attempt is not None and attempt != self._attempt:
+                return   # tentativa obsoleta
+            if arr.size and self.t_first is None:
+                self.t_first = time.monotonic()
+            self.samples += arr.size
+            self.samplerate = int(samplerate)
+            self._q.put((arr, int(samplerate), bool(last)))
+
+    def fail(self) -> None:
+        self.failed = True
+
+    def finish(self) -> None:
+        """Marca o fim do stream (idempotente)."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._q.put(JOB_END)
+
+    def cancel(self) -> None:
+        """Abandona o job (também serve de `cancel()` p/ `_drop_oldest_put`)."""
+        self.cancelled.set()
+        self.finish()
+
+    def get(self, timeout: float = 0.2):
+        """Próximo `(pcm, samplerate, last)`, `JOB_END` ou None (timeout)."""
+        try:
+            return self._q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def log_done(self, nchars: int, rate: str, t0: float) -> None:
+        now = time.monotonic()
+        primeiro = (self.t_first - t0) * 1000 if self.t_first else 0.0
+        log_tts.info("síntese %d chars rate=%s: 1º trecho em %.0f ms, total "
+                     "%.0f ms (áudio %.2fs @%d Hz)", nchars, rate, primeiro,
+                     (now - t0) * 1000, self.samples / max(1, self.samplerate),
+                     self.samplerate)
+
+
 class TtsSpeaker:
     """Voz pt-BR via edge-tts (nuvem, gratuito), com API síncrona.
 
@@ -563,6 +858,11 @@ class TtsSpeaker:
     # offline por _EDGE_COOLDOWN_S, e só então testamos a nuvem de novo.
     _EDGE_FAIL_LIMIT = 3
     _EDGE_COOLDOWN_S = 60.0
+    # streaming: 1ª decodificação com ~0.2 s de mp3 (48 kbps = 6000 B/s), as
+    # seguintes a cada ~0.4 s; segura 1 quadro mp3 (1152 amostras @24 kHz)
+    _STREAM_FIRST_BYTES = 1200
+    _STREAM_STEP_BYTES = 2400
+    _MP3_FRAME = 1152
 
     def __init__(self, voice: str = "pt-BR-FranciscaNeural") -> None:
         self.voice = voice
@@ -607,58 +907,71 @@ class TtsSpeaker:
                          len(t), len(_SENT_RE.split(t)))
         return t
 
-    async def _stream_mp3(self, text: str, rate: str) -> bytes:
+    @staticmethod
+    def _decode_prefix(data: bytes) -> "Optional[tuple[np.ndarray, int]]":
+        """Decodifica um mp3 TRUNCADO (soundfile lê o prefixo sem reclamar).
+
+        Medido com mp3 real do edge-tts: o prefixo decodifica igual ao arquivo
+        inteiro, exceto a última fração de quadro (a amostra final de um
+        prefixo pode vir parcial), por isso quem chama segura 1 quadro.
+        Devolve None se ainda não deu para decodificar nada.
+        """
+        try:
+            import soundfile as sf
+            pcm, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+        except Exception:
+            return None
+        if not pcm.size:
+            return None
+        return np.ascontiguousarray(pcm.mean(axis=1), dtype=np.float32), int(sr)
+
+    async def _stream_job(self, text: str, rate: str, job: "TtsJob",
+                          attempt: Optional[int] = None) -> None:
+        """Faz o stream do edge-tts e empurra PCM no `job` à medida que chega.
+
+        A cada ~0.4 s de mp3 recebido decodifica o buffer acumulado e entrega
+        só as amostras novas, segurando o último quadro (1152 amostras) até
+        haver mais dados ou o fim: quadro parcial nunca vira estalo. A
+        decodificação repetida é O(n²), mas custa ~2,5 ms mesmo para 6,5 s de
+        fala (medido), irrelevante perto da rede.
+        """
         import edge_tts
         comm = edge_tts.Communicate(text, self.voice, rate=rate)
         buf = bytearray()
+        emitted = 0
+        next_at = self._STREAM_FIRST_BYTES
         async for chunk in comm.stream():
-            if chunk.get("type") == "audio":
-                buf.extend(chunk["data"])
-        return bytes(buf)
+            if job.cancelled.is_set() or (
+                    attempt is not None and not job.is_current(attempt)):
+                return
+            if chunk.get("type") != "audio":
+                continue
+            buf.extend(chunk["data"])
+            if len(buf) < next_at:
+                continue
+            next_at = len(buf) + self._STREAM_STEP_BYTES
+            dec = self._decode_prefix(bytes(buf))
+            if dec is None:
+                continue
+            pcm, sr = dec
+            end = pcm.size - self._MP3_FRAME
+            if end > emitted:
+                job.put_chunk(pcm[emitted:end], sr, attempt=attempt)
+                emitted = end
+        if job.cancelled.is_set():
+            return
+        if not buf:
+            raise RuntimeError("edge-tts devolveu áudio vazio")
+        pcm, sr, dec = _decode_audio(bytes(buf))   # fim: decodificação completa
+        if pcm.size == 0 or sr <= 0:
+            raise RuntimeError("decodificação resultou em áudio vazio")
+        if self._decoder != dec:
+            self._decoder = dec
+            log_tts.info("decodificador de mp3 ativo: %s", dec)
+        job.put_chunk(pcm[min(emitted, pcm.size):], sr, last=True, attempt=attempt)
 
-    def synth(self, text: str, rate_pct: int = 0,
-              source: Optional[Translation] = None) -> Optional[TtsAudio]:
-        """Sintetiza `text` acelerado em `rate_pct`%. None se a rede falhar."""
-        t = self._prepare(text)
-        if not t:
-            return None
-        rate = f"{'+' if rate_pct >= 0 else '-'}{abs(int(rate_pct))}%"
-        if time.monotonic() < self._edge_blocked_until:
-            return self._synth_sapi(t, rate_pct, source)   # nuvem em quarentena
-        delays = (0.8,)
-        for tentativa in range(2):
-            t0 = time.monotonic()
-            fut = None
-            try:
-                fut = asyncio.run_coroutine_threadsafe(
-                    self._stream_mp3(t, rate), self._loop)
-                mp3 = fut.result(timeout=8)
-                if not mp3:
-                    raise RuntimeError("edge-tts devolveu áudio vazio")
-                pcm, sr, dec = _decode_audio(mp3)
-                if pcm.size == 0 or sr <= 0:
-                    raise RuntimeError("decodificação resultou em áudio vazio")
-                if self._decoder != dec:
-                    self._decoder = dec
-                    log_tts.info("decodificador de mp3 ativo: %s", dec)
-                dur = pcm.size / sr
-                log_tts.info("síntese %d chars rate=%s em %.0f ms (áudio %.2fs @%d Hz)",
-                             len(t), rate, (time.monotonic() - t0) * 1000, dur, sr)
-                self._edge_fails = 0
-                return TtsAudio(pcm=pcm, samplerate=sr,
-                                source=source or _placeholder_translation(t))
-            except Exception as exc:
-                # sem isto a corotina abandonada seguia rodando no loop e as
-                # conexões pendentes iam se acumulando sessão afora
-                if fut is not None:
-                    fut.cancel()
-                if tentativa < len(delays):
-                    log_tts.warning("falha na síntese (tentativa %d): %s, nova em %.1fs",
-                                    tentativa + 1, exc, delays[tentativa])
-                    time.sleep(delays[tentativa])
-                else:
-                    log_tts.warning("edge-tts indisponível (%s), usando voz "
-                                    "offline do Windows", exc)
+    def _note_edge_failure(self) -> None:
+        """Disjuntor: contabiliza uma síntese que falhou de vez na nuvem."""
         self._edge_fails += 1
         if self._edge_fails >= self._EDGE_FAIL_LIMIT:
             self._edge_blocked_until = time.monotonic() + self._EDGE_COOLDOWN_S
@@ -666,7 +979,110 @@ class TtsSpeaker:
             log_tts.warning("edge-tts falhou %d vezes seguidas, só voz offline "
                             "pelos próximos %.0fs", self._EDGE_FAIL_LIMIT,
                             self._EDGE_COOLDOWN_S)
-        return self._synth_sapi(t, rate_pct, source)
+
+    def synth_stream(self, text: str, rate_pct: int = 0,
+                     source: Optional[Translation] = None,
+                     job: "Optional[TtsJob]" = None) -> "TtsJob":
+        """Sintetiza empurrando PCM em `job` (criado aqui se não vier) e o encerra.
+
+        Bloqueia até o fim da síntese (roda numa thread de pool); quem toca
+        consome `job.get()` em paralelo. Falha ANTES do 1º trecho: tenta de
+        novo, depois cai na voz offline (SAPI, um trecho só). Falha DEPOIS de
+        já haver áudio no job: avisa e encerra (não repete do início).
+        """
+        job = job if job is not None else TtsJob(source)
+        t0 = time.monotonic()
+        try:
+            self._synth_into(job, text, rate_pct, source, t0)
+        except Exception:
+            log_tts.exception("erro inesperado na síntese")
+            job.fail()
+        finally:
+            job.finish()
+        return job
+
+    def _synth_into(self, job: "TtsJob", text: str, rate_pct: int,
+                    source: Optional[Translation], t0: float) -> None:
+        t = self._prepare(text)
+        if not t:
+            return
+        rate = f"{'+' if rate_pct >= 0 else '-'}{abs(int(rate_pct))}%"
+        if time.monotonic() < self._edge_blocked_until:
+            self._stream_sapi(job, t, rate_pct, source)   # nuvem em quarentena
+            return
+        delays = (0.8,)
+        for tentativa in range(2):
+            fut = None
+            if job.cancelled.is_set():   # descartado: não gasta uma conexão
+                return
+            aid = job.new_attempt()
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._stream_job(t, rate, job, aid), self._loop)
+                fut.result(timeout=8)
+                if job.cancelled.is_set():
+                    return
+                if job.samples == 0:
+                    raise RuntimeError("edge-tts devolveu áudio vazio")
+                job.log_done(len(t), rate, t0)
+                self._edge_fails = 0
+                return
+            except Exception as exc:
+                # sem isto a corotina abandonada seguia rodando no loop e as
+                # conexões pendentes iam se acumulando sessão afora
+                if fut is not None:
+                    fut.cancel()
+                job.new_attempt()   # a tentativa que falhou não empurra mais nada
+                if job.cancelled.is_set():
+                    return
+                if job.samples > 0:
+                    # já tocou parte da frase: não repete do início
+                    log_tts.warning("síntese interrompida no meio (%s); frase "
+                                    "cortada em %.2fs de áudio", exc,
+                                    job.samples / max(1, job.samplerate))
+                    job.fail()
+                    self._note_edge_failure()
+                    return
+                if tentativa < len(delays):
+                    log_tts.warning("falha na síntese (tentativa %d): %s, nova em %.1fs",
+                                    tentativa + 1, exc, delays[tentativa])
+                    time.sleep(delays[tentativa])
+                else:
+                    log_tts.warning("edge-tts indisponível (%s), usando voz "
+                                    "offline do Windows", exc)
+        self._note_edge_failure()
+        self._stream_sapi(job, t, rate_pct, source)
+
+    def _stream_sapi(self, job: "TtsJob", text: str, rate_pct: int,
+                     source: Optional[Translation]) -> None:
+        """Voz offline como um único trecho (o SAPI não faz streaming)."""
+        if job.cancelled.is_set():
+            return
+        audio = self._synth_sapi(text, rate_pct, source)
+        if audio is not None:
+            job.put_chunk(audio.pcm, audio.samplerate, last=True)
+
+    def synth(self, text: str, rate_pct: int = 0,
+              source: Optional[Translation] = None) -> Optional[TtsAudio]:
+        """Sintetiza `text` acelerado em `rate_pct`%. None se tudo falhar.
+
+        Versão não-streaming, em cima do mesmo caminho: junta os trechos.
+        """
+        job = self.synth_stream(text, rate_pct, source)
+        parts, sr = [], 0
+        while True:
+            item = job.get(timeout=0.05)
+            if item is JOB_END:
+                break
+            if item is None:
+                continue
+            parts.append(item[0])
+            sr = item[1]
+        pcm = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+        if pcm.size == 0 or sr <= 0:
+            return None
+        return TtsAudio(pcm=pcm, samplerate=sr,
+                        source=source or _placeholder_translation(text))
 
     def _synth_sapi(self, text: str, rate_pct: int,
                     source: Optional[Translation]) -> Optional[TtsAudio]:

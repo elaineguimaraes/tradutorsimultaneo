@@ -361,6 +361,153 @@ def test_corrigir_sem_entradas_mortas() -> None:
         assert dead == [], (fname, dead)
 
 
+def test_gap_fill() -> None:
+    gl = _new_glossary()
+    casos = [
+        ("NDX, there's a downside gap fill to 29647.", ["fechamento de gap abaixo"]),
+        ("So, downside gap fill to 6 and 647 if you're looking at IWM.",
+         ["fechamento de gap abaixo"]),
+        ("Downside gap filled to 280.61, RTY", ["gap abaixo fechado"]),
+        ("down side gapfills.", ["fechamentos de gap abaixo"]),
+        ("So their are downside gap fills so just from a technical perspective",
+         ["fechamentos de gap abaixo"]),
+        ("The upside gap fill is in play", ["fechamento de gap acima"]),
+        ("we want to fill the gap", ["fechar o gap"]),
+        ("it filled the gap", ["fechou o gap"]),
+        ("it is filling the gap", ["fechando o gap"]),
+        ("the gap was filled", ["gap foi fechado"]),
+        ("a gap-fill today", ["fechamento de gap"]),
+        ("the gap got filled", ["gap foi fechado"]),
+        ("the gap gets filled", ["gap é fechado"]),
+        ("the gap has been filled", ["gap foi fechado"]),
+        ("the gap getting filled", ["gap sendo fechado"]),
+    ]
+    for en, esperados in casos:
+        masked, found = gl.mask(en)
+        print(f"    {en!r} -> {masked!r} {found}")
+        for e in esperados:
+            assert e in found, (en, masked, found)
+        # nada do jargão antigo sobra solto no texto enviado ao MT
+        assert "fill" not in masked.lower().replace("filled", ""), (en, masked)
+    # "downside gap" sozinho continua valendo
+    assert "gap de baixa" in gl.mask("a downside gap today")[1]
+
+
+def test_termos_da_sessao() -> None:
+    gl = _new_glossary()
+    casos = [
+        ("It's a free trial", "teste grátis"),
+        ("the free trial", "o teste grátis"),
+        ("they were churning accounts", "estavam queimando contas"),
+        ("they are churning accounts", "estão queimando contas"),
+        ("the trial period", "período de teste"),
+        ("churning through accounts", "queimando contas"),
+        ("they keep churning accounts", "queimando contas"),
+        ("just churn through accounts", "queimar contas"),
+        ("the copy app", "app de copy trade"),
+        ("copy trading is hot", "copy trade"),
+        ("Have you traded the levels today", "você já operou"),
+        ("Did you trade SPY", "você operou"),
+        ("this is my play", "minha jogada"),
+        ("that is your play", "sua jogada"),
+        ("Tasty Live is on", "Tasty Live"),
+        ("I watch tastylive", "tastylive"),
+        ("on Tastytrade", "Tastytrade"),
+        ("on Tasty Trade", "Tasty Trade"),
+    ]
+    for en, esperado in casos:
+        masked, found = gl.mask(en)
+        assert esperado in found, (en, masked, found)
+    # o verbo "play" e o verbo "trade" soltos continuam intactos
+    assert "minha jogada" not in gl.mask("we play the open")[1]
+    assert gl.mask("They just trade the levels")[1] == []
+    # notícia de tribunal/ensaio clínico não pode virar "período de teste"
+    for en in ("The trial results for the drug", "He went into the trial"):
+        assert gl.mask(en)[1] == [], en
+    voc = gl.asr_vocabulary
+    assert "Tastytrade" in voc and "VIXY" in voc and len(voc) <= 300, voc
+
+
+def test_prop_firm() -> None:
+    gl = _new_glossary()
+    casos = [
+        ("I passed my evals", "minhas avaliações"),
+        ("I need an eval", "uma avaliação"),
+        ("my evaluation account", "conta de avaliação"),
+        ("two evaluation accounts", "contas de avaliação"),
+        ("my funded account", "minha conta financiada"),
+        ("three funded accounts", "contas financiadas"),
+        ("a funded account", "conta financiada"),
+        ("5-SIM to Funded Options account", "conta financiada de opções"),
+        ("a Funded Futures account", "conta financiada de futuros"),
+        ("the e-vals today", "avaliações"),
+        ("the e-vails today", "avaliações"),
+        ("the evails today", "avaliações"),
+        ("the e-vows today", "avaliações"),
+        ("one e-val", "avaliação"),
+        ("one e-vail", "avaliação"),
+        ("one e-vow", "avaliação"),
+    ]
+    for en, esperado in casos:
+        masked, found = gl.mask(en)
+        assert esperado in found, (en, masked, found)
+    assert gl.mask("the evaluation of the report")[1] == [] or         "avaliação" not in gl.mask("the evaluation of the report")[1]
+
+
+def test_prop_firm_concordancia() -> None:
+    gl = _new_glossary()
+    # (a) determinante no mapa "traduzir": o MT nem chega a ver o artigo masculino
+    casos = [
+        ("my evals", "minhas avaliações"),
+        ("my eval", "minha avaliação"),
+        ("an eval", "uma avaliação"),
+        ("your evals", "suas avaliações"),
+        ("my funded accounts", "minhas contas financiadas"),
+        ("your funded account", "sua conta financiada"),
+        ("two funded accounts", "duas contas financiadas"),
+        ("my e-vows", "minhas avaliações"),
+        ("my e-vals", "minhas avaliações"),
+        ("my e-vow", "minha avaliação"),
+        ("my e vow", "minha avaliação"),
+        ("the e vows", "avaliações"),
+        ("the e vals", "avaliações"),
+        ("the e vails", "avaliações"),
+    ]
+    for en, esperado in casos:
+        masked, found = gl.mask(en)
+        assert esperado in found, (en, masked, found)
+    # (b) corretor de artigo na saída (gênero + número)
+    fixes = [
+        ("meu avaliações", "minhas avaliações"),
+        ("dois contas financiadas", "duas contas financiadas"),
+        ("um avaliação", "uma avaliação"),
+        ("Meu avaliação", "Minha avaliação"),
+        ("Seu conta financiada", "Sua conta financiada"),
+        ("os contas financiadas", "as contas financiadas"),
+        ("o conta de avaliação", "a conta de avaliação"),
+    ]
+    for pt, esperado in fixes:
+        assert gl.fix(pt, "") == esperado, (pt, gl.fix(pt, ""))
+    # "o conta" (pronome + verbo) fora desse contexto não é tocado
+    assert gl.fix("ele o conta hoje", "") == "ele o conta hoje"
+
+
+def test_quality_log_desligado_por_padrao() -> None:
+    import tradutor.glossary as g
+    assert g._QLOG_ENABLED is False, "traducoes.log só pode ser ligado pelo app"
+
+
+def test_vocabulario_asr() -> None:
+    vocab = Glossary(theme_path("trading")).asr_vocabulary
+    assert vocab, "trading deveria ter vocabulario_asr"
+    assert len(vocab) <= 300, len(vocab)
+    assert "Nasdaq" in vocab and not vocab.endswith(","), vocab
+    assert Glossary(theme_path("geral")).asr_vocabulary == ""
+    # arquivo ausente: padrão vazio
+    ausente = os.path.join(GLOSSARIOS_DIR, "_nao_existe.json")
+    assert Glossary(ausente).asr_vocabulary == ""
+
+
 TESTS = [
     test_long_short_lookaround,
     test_long_short_protegido_vs_duracao,
@@ -390,6 +537,12 @@ TESTS = [
     test_todos_os_temas_validos,
     test_market_flag_padrao_e_arquivo_ausente,
     test_corrigir_sem_entradas_mortas,
+    test_gap_fill,
+    test_prop_firm,
+    test_prop_firm_concordancia,
+    test_termos_da_sessao,
+    test_quality_log_desligado_por_padrao,
+    test_vocabulario_asr,
 ]
 
 

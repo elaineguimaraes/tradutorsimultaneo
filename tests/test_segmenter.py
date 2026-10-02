@@ -24,8 +24,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 from tradutor.contracts import SR_ASR, SpeechSegment          # noqa: E402
 from tradutor.segmenter import (SpeechSegmenter, Transcriber,  # noqa: E402
-                                collapse_repetitions, energy_vad,
-                                is_hallucination)
+                                _echoes_prompt, _prompt_tail,
+                                _strip_prompt_overlap, collapse_repetitions,
+                                energy_vad, is_hallucination)
 
 try:  # acentos no console do Windows
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -239,6 +240,165 @@ def test_max_segment_corta() -> None:
     assert abs(sum(durs) - 12.0) < 1.5, f"soma das durações = {sum(durs):.2f}s"
 
 
+def test_forced_cut_marcado() -> None:
+    """Corte por max_segment_s sai com forced_cut=True; o fim por silêncio, False."""
+    col = Collector()
+    seg = SpeechSegmenter(col, silence_ms=600, max_segment_s=3.0,
+                          min_speech_ms=250, use_silero=False)
+    audio = np.concatenate([silence(0.5), synth_speech(7.0, seed=3),
+                            silence(1.5)]).astype(np.float32)
+    try:
+        feed_all(seg, audio)
+    finally:
+        seg.stop()
+    flags = [s.forced_cut for s in col.segments]
+    print(f"    forced_cut={flags}")
+    assert len(flags) >= 3, flags
+    assert all(flags[:-1]), f"cortes intermediários devem ser forçados: {flags}"
+    assert flags[-1] is False, f"o último (silêncio) não é corte forçado: {flags}"
+
+
+def test_forced_cut_respiro_no_limite() -> None:
+    """Respiro (150 ms) perto dos 7 s e a fala continua: 1º segmento é corte forçado."""
+    for voz in (6.5, 6.7, 6.8, 6.85, 6.9, 6.95, 7.0):
+        col = Collector()
+        seg = SpeechSegmenter(col, silence_ms=450, max_segment_s=7.0,
+                              min_speech_ms=250, use_silero=False)
+        audio = np.concatenate([silence(0.5), synth_speech(voz, seed=3),
+                                silence(0.15), synth_speech(3.0, seed=5),
+                                silence(1.5)]).astype(np.float32)
+        try:
+            feed_all(seg, audio)
+        finally:
+            seg.stop()
+        flags = [x.forced_cut for x in col.segments]
+        print(f"    voz={voz} forced_cut={flags}")
+        assert len(flags) == 2, (voz, flags)
+        assert flags == [True, False], (voz, flags)
+
+
+def test_espera_do_limite_tem_teto() -> None:
+    """A espera por um respiro no limite de 7 s é limitada a max_seg + silence."""
+    def novo():
+        col = Collector()
+        seg = SpeechSegmenter(col, silence_ms=450, max_segment_s=7.0,
+                              min_speech_ms=250, use_silero=False)
+        seg.stop()                       # o teste dirige _process à mão
+        seg._vad = lambda win: []        # VAD que nunca vê voz nova
+        seg._t_origin = time.monotonic()
+        n = int(7.6 * SR_ASR)
+        seg._buf = np.zeros(n, dtype=np.float32)
+        seg._buf_start, seg._total = 0, n
+        seg._in_speech, seg._speech_start, seg._voice_start = True, 0, 0
+        return col, seg
+
+    def roda(total_s: float, last_voice_s: float):
+        col, seg = novo()
+        seg._last_voice = int(last_voice_s * SR_ASR)
+        seg._process(int(total_s * SR_ASR), force=True)
+        return col.segments
+
+    # pausa de 200 ms no limite: espera (nada emitido ainda)
+    assert roda(7.1, 6.9) == []
+    # pausa de 400 ms (< silence_ms) com o teto esgotado: corta, forçado
+    segs = roda(7.5, 7.1)
+    assert len(segs) == 1 and segs[0].forced_cut is True, segs
+    # sem pausa (voz agora): corta na hora, forçado
+    segs = roda(7.1, 7.1)
+    assert len(segs) == 1 and segs[0].forced_cut is True, segs
+    # pausa de 450 ms: fim de frase por silêncio, NÃO forçado
+    segs = roda(7.55, 7.1)
+    assert len(segs) == 1 and segs[0].forced_cut is False, segs
+
+
+def test_forced_cut_padrao_false() -> None:
+    """Construtores antigos de SpeechSegment seguem valendo (padrão False)."""
+    s = SpeechSegment(pcm=np.zeros(10, dtype=np.float32), t_start=0.0, t_end=1.0)
+    assert s.forced_cut is False
+
+
+def test_eco_do_prompt() -> None:
+    prompt = ("Nasdaq, S&P 500, SPY, QQQ, Dow, calls, puts, gamma. "
+              "I don't think the market is going up")
+    # eco total (>= 6 palavras): trecho contíguo do prompt
+    assert _echoes_prompt("Nasdaq, S&P 500, SPY, QQQ, Dow", prompt)
+    assert _echoes_prompt("think the market is going up", prompt)
+    # >= 70% dos trigramas no prompt
+    assert _echoes_prompt("Nasdaq S&P 500 SPY QQQ Dow calls", prompt)
+    # fala curta legítima que repete o vocabulário/contexto passa
+    assert not _echoes_prompt("The market is going up.", prompt)
+    assert not _echoes_prompt("Nasdaq, S&P 500.", prompt)
+    assert not _echoes_prompt("Calls, puts, gamma.", prompt)
+    # fala nova e longa
+    assert not _echoes_prompt("The Nasdaq is up today and the Dow is flat", prompt)
+    assert not _echoes_prompt("anything at all here today folks", "")
+
+
+def test_strip_overlap_do_prompt() -> None:
+    prompt = "We're expecting up three tenths our last look"
+    out = _strip_prompt_overlap(
+        "three tenths our last look was up 3 tenths.", prompt)
+    assert out == "was up 3 tenths.", out
+    # 4 palavras coincidentes não bastam (pode ser repetição natural)
+    same = "tenths our last look was great"
+    assert _strip_prompt_overlap(same, prompt) == same
+    other = "something else entirely"
+    assert _strip_prompt_overlap(other, prompt) == other
+
+
+def test_sem_contexto_nao_passa_prompt() -> None:
+    """use_context=False: sem hotwords nem prompt (testa o helper, sem Whisper)."""
+    asr = Transcriber.__new__(Transcriber)
+    asr._ctx_lock = threading.Lock()
+    asr._vocabulary = "Nasdaq, Nvidia"
+    asr._prev_text = "we saw the Nasdaq rally"
+    asr._prev_t_end = 1.0
+    asr._prev_lang = "en"
+    seg = SpeechSegment(pcm=np.zeros(10, dtype=np.float32), t_start=1.5, t_end=2.5)
+    asr.use_context = True
+    assert asr._context_for(seg) == ("Nasdaq, Nvidia", "we saw the Nasdaq rally")
+    asr._prev_t_end = -10.0      # lacuna grande: sem prompt, só hotwords
+    assert asr._context_for(seg) == ("Nasdaq, Nvidia", "")
+    asr._prev_t_end = 1.0
+    asr.use_context = False
+    assert asr._context_for(seg) == ("", "")
+
+
+def test_forced_cut_fim_de_frase_na_janela_de_silencio() -> None:
+    """6,8 s de voz + silêncio: o limite de 7 s estoura dentro do silêncio."""
+    col = Collector()
+    seg = SpeechSegmenter(col, silence_ms=450, max_segment_s=7.0,
+                          min_speech_ms=250, use_silero=False)
+    audio = np.concatenate([silence(0.5), synth_speech(6.8, seed=3),
+                            silence(3.0)]).astype(np.float32)
+    try:
+        feed_all(seg, audio)
+    finally:
+        seg.stop()
+    flags = [s.forced_cut for s in col.segments]
+    print(f"    forced_cut={flags}")
+    assert len(flags) == 1 and flags[0] is False, flags
+
+
+def test_prompt_tail_em_fronteira_de_palavra() -> None:
+    assert _prompt_tail("short text") == "short text"
+    long = " ".join(f"word{i}" for i in range(100))
+    tail = _prompt_tail(long)
+    assert len(tail) <= 200
+    assert long.endswith(tail)
+    assert tail.split()[0].startswith("word"), tail
+    assert long[-len(tail) - 1] == " "   # começa numa palavra inteira
+
+
+def test_idioma_origem() -> None:
+    from tradutor.config import AppConfig
+    from tradutor.segmenter import _norm_language
+    assert AppConfig().idioma_origem == "en"
+    assert _norm_language("en") == "en" and _norm_language(" EN ") == "en"
+    assert _norm_language("auto") is None and _norm_language(None) is None
+    assert _norm_language("") is None
+
+
 def test_min_speech_descarta() -> None:
     """Estalo de 100 ms não vira segmento."""
     col = Collector()
@@ -379,10 +539,20 @@ TESTS = [
     test_segmentacao_vad_energia,
     test_segmentacao_silero,
     test_max_segment_corta,
+    test_forced_cut_marcado,
+    test_forced_cut_respiro_no_limite,
+    test_espera_do_limite_tem_teto,
+    test_forced_cut_padrao_false,
+    test_eco_do_prompt,
+    test_strip_overlap_do_prompt,
+    test_sem_contexto_nao_passa_prompt,
+    test_forced_cut_fim_de_frase_na_janela_de_silencio,
+    test_prompt_tail_em_fronteira_de_palavra,
     test_min_speech_descarta,
     test_flush_emite_parcial,
     test_feed_nao_bloqueia,
     test_transcriber_silencio,
+    test_idioma_origem,
 ]
 
 

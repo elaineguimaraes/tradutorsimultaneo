@@ -3,6 +3,7 @@
   "descricao": "Modelo para novos temas: nenhuma regra específica; o tradutor usa só o modelo.",
   "auto_proteger_nomes": false,
   "regras_de_mercado": false,
+  "vocabulario_asr": [],
   "proteger": [],
   "tickers": {},
   "traduzir": {},

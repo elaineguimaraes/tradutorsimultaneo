@@ -6,13 +6,13 @@ contracts.py. Executar:  python -m tradutor.main  (com src/ no PYTHONPATH)
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Optional
 
 import numpy as np
@@ -21,6 +21,8 @@ from tradutor import dsp
 from tradutor.config import AppConfig
 from tradutor.contracts import (SR_ASR, SR_NATIVE, SpeechSegment, Transcript,
                                 Translation, UiState)
+from tradutor.sentence_buffer import SentenceBuffer
+from tradutor.translate_tts import JOB_END, TtsJob
 
 log = logging.getLogger("tradutor.main")
 
@@ -56,6 +58,12 @@ class Pipeline:
         self._speaker = None
         self._glossary = None
         self._tts_pool: Optional[ThreadPoolExecutor] = None
+        # re-junta frases cortadas por max_segment_s antes do MT (thread do MT;
+        # reset() vem de start/stop e o buffer tem lock próprio)
+        self._playing_job = None    # job de TTS em reprodução (p/ "ao vivo")
+        self._joiner = SentenceBuffer(
+            max_hold_s=config.max_espera_frase_s,
+            max_pending_words=max(0, int(config.max_palavras_espera)))
         self._threads: list[threading.Thread] = []
         self._components_ready = False
         self._capture_lock = threading.Lock()   # serializa trocas de captura
@@ -100,12 +108,16 @@ class Pipeline:
             silence_ms=cfg.silence_ms, max_segment_s=cfg.max_segment_s)
 
         self._transcriber = Transcriber(model_size=cfg.whisper_model,
-                                        compute_type="int8", cpu_threads=8)
+                                        compute_type="int8", cpu_threads=8,
+                                        use_context=cfg.contexto_asr,
+                                        language=cfg.idioma_origem)
         self._translator = Translator(target="pt")
         self._translator.ensure_ready(["en"])
         from tradutor.glossary import Glossary, set_quality_log, theme_path
-        set_quality_log(getattr(cfg, "gravar_log", True))
+        set_quality_log(getattr(cfg, "gravar_log", False))
         self._glossary = Glossary(theme_path(cfg.glossario))
+        self._transcriber.set_vocabulary(
+            self._glossary.asr_vocabulary if cfg.contexto_asr else "")
         self._speaker = TtsSpeaker(voice=cfg.tts_voice)
         self._capture = LoopbackCapture(device_hint=cfg.capture_device_hint,
                                         samplerate=SR_NATIVE)
@@ -155,7 +167,7 @@ class Pipeline:
                 except queue.Empty:
                     continue
                 log.warning("fila %s cheia, descartando o item mais antigo", label)
-                cancel = getattr(stale, "cancel", None)   # Futures de TTS
+                cancel = getattr(stale, "cancel", None)   # jobs de TTS
                 if cancel is not None:
                     try:
                         cancel()
@@ -193,90 +205,181 @@ class Pipeline:
                 "hm", "huh", "yeah", "okay", "ok"}
 
     def _mt_worker(self, gen: int) -> None:
+        last: Optional[Transcript] = None   # molde p/ o Transcript da cauda liberada
         while self._alive(gen):
             try:
                 tr = self._q_mt.get(timeout=0.3)
             except queue.Empty:
+                # sem continuação à vista: libera a cauda que esperou demais
+                # (ASR descartou o resto, música…) para não ficar muda
+                if last is not None:
+                    for text, lang in self._joiner.flush_due():
+                        if not self._alive(gen):
+                            return
+                        log.info("cauda da frase liberada por tempo: %r", text[:60])
+                        self._translate_and_queue(
+                            text, dataclasses.replace(last, text=text, lang=lang),
+                            gen)
                 continue
             # muletas de fala ("uh", "um"…) não merecem legenda nem voz
             if tr.text.strip(" .,!?").lower() in self._FILLERS:
                 continue
-            try:
-                text_pt = self._glossary.apply(
-                    lambda t: self._translator.translate(t, tr.lang), tr.text)
-            except Exception:
-                log.exception("falha na tradução")
-                text_pt = tr.text
-            trans = Translation(text_pt=text_pt, source=tr)
-            if self._gui is not None and text_pt.strip():
-                self._gui.push_subtitle(tr.text, text_pt)
-            # fala pt->pt não precisa de TTS (já é audível no original)
-            if tr.lang != "pt":
-                # síntese em paralelo (2 por vez); a fila guarda Futures em
-                # ordem de fala e o tts_worker consome nessa mesma ordem:
-                # a frase N+1 sintetiza ENQUANTO a N ainda está tocando.
-                pool = self._tts_pool
-                if pool is None:      # parada concorrente descartou o pool
-                    continue
-                try:
-                    fut = pool.submit(self._synth_one, trans)
-                except RuntimeError:  # pool já encerrado
-                    continue
-                self._drop_oldest_put(self._q_tts, fut, "TTS")
+            last = tr
+            if not self.config.juntar_frases:
+                self._translate_and_queue(tr.text, tr, gen)
+                continue
+            items = self._joiner.push(tr.text, tr.lang, tr.segment.forced_cut,
+                                      tr.segment.t_start, tr.segment.t_end)
+            if not items and self._joiner.pending():
+                log.debug("frase incompleta segurada: %r",
+                          self._joiner.pending()[:60])
+            for text, lang in items:
+                if not self._alive(gen):
+                    return
+                self._translate_and_queue(
+                    text, dataclasses.replace(tr, text=text, lang=lang), gen)
 
-    def _synth_one(self, trans: Translation):
-        """Roda no pool: sintetiza uma frase; devolve (audio, rate) ou None."""
-        rate = self._adaptive_rate()
+    def _translate_and_queue(self, text: str, tr: Transcript, gen: int) -> None:
+        """Traduz `text` (já re-juntado), publica a legenda e agenda o TTS."""
         try:
-            audio = self._speaker.synth(trans.text_pt, rate_pct=rate,
-                                        source=trans)
+            text_pt = self._glossary.apply(
+                lambda t: self._translator.translate(t, tr.lang), text)
+        except Exception:
+            log.exception("falha na tradução")
+            text_pt = text
+        trans = Translation(text_pt=text_pt, source=tr)
+        if self._gui is not None and text_pt.strip():
+            self._gui.push_subtitle(text, text_pt)
+        # fala pt->pt não precisa de TTS (já é audível no original)
+        if tr.lang != "pt":
+            # síntese em paralelo (2 por vez); a fila guarda os JOBS em ordem
+            # de fala e o tts_worker toca os trechos de cada um conforme
+            # chegam: a frase N+1 sintetiza ENQUANTO a N ainda está tocando.
+            pool = self._tts_pool
+            # thread MT de geração antiga (pausa/retomada rápida) não pode
+            # submeter no pool novo nem encher a fila do pipeline novo
+            if pool is None or not self._alive(gen):
+                return
+            job = TtsJob(trans)
+            try:
+                pool.submit(self._synth_job, job)
+            except RuntimeError:  # pool já encerrado
+                return
+            if not self._alive(gen):
+                job.cancel()
+                return
+            self._drop_oldest_put(self._q_tts, job, "TTS")
+
+    def _synth_job(self, job: TtsJob) -> None:
+        """Roda no pool: sintetiza a frase empurrando PCM no job (streaming)."""
+        if job.cancelled.is_set():   # descartado na fila antes de começar
+            job.finish()
+            return
+        job.rate = self._adaptive_rate()
+        try:
+            self._speaker.synth_stream(job.source.text_pt, rate_pct=job.rate,
+                                       source=job.source, job=job)
         except Exception:
             log.exception("falha no TTS")
-            return None
-        return None if audio is None else (audio, rate)
+        finally:
+            job.finish()   # o worker de TTS nunca fica esperando um job órfão
 
     _SYNTH_DEADLINE_S = 45.0
 
     def _tts_worker(self, gen: int) -> None:
         while self._alive(gen):
             try:
-                fut = self._q_tts.get(timeout=0.3)
+                job = self._q_tts.get(timeout=0.3)
             except queue.Empty:
                 continue
-            # espera em fatias curtas: um `result(timeout=45)` seco deixava
-            # esta thread surda a um `Pausar` por quase um minuto
-            res = None
-            t_dead = time.monotonic() + self._SYNTH_DEADLINE_S
-            while True:
-                if not self._alive(gen):
-                    fut.cancel()
-                    return
-                try:
-                    res = fut.result(timeout=0.5)
-                    break
-                except FutureTimeout:
-                    if time.monotonic() >= t_dead:
-                        log.warning("síntese passou de %.0fs, frase pulada",
-                                    self._SYNTH_DEADLINE_S)
-                        fut.cancel()
-                        break
-                except Exception:
-                    log.exception("síntese não concluiu")
-                    break
-            if res is None:
-                continue
-            audio, rate = res
-            pcm = audio.pcm
-            if audio.samplerate != SR_NATIVE:
-                pcm = dsp.resample(pcm, audio.samplerate, SR_NATIVE)
-            # proteção de atraso máximo: descarta fila antiga e avisa
-            if self._mixer.tts_backlog_seconds() > self.config.max_backlog_s:
-                log.warning("backlog > %.0fs, pulando para o ao vivo",
-                            self.config.max_backlog_s)
-                self._mixer.clear_tts()
-            self._mixer.enqueue_tts(pcm)
+            if not self._play_job(job, gen):
+                return
+
+    # sobra de ~10 ms retida de cada trecho: se o stream acabar de repente (falha
+    # no meio, prazo), o último trecho ainda sai com fade de saída de verdade
+    _PLAY_TAIL_SAMPLES = SR_NATIVE // 100
+
+    def _play_job(self, job: TtsJob, gen: int) -> bool:
+        """Toca os trechos do job conforme chegam. False = pipeline parou.
+
+        Espera em fatias curtas (`get(timeout=0.2)`): um bloqueio seco deixava
+        esta thread surda a um `Pausar`. O prazo de 45 s vale para o job
+        inteiro; o backlog é checado uma vez, antes do 1º trecho. "Ao vivo"
+        cancela o job em andamento (`_playing_job`) para o resto da frase
+        velha não tocar depois da limpeza do mixer.
+        """
+        with self._lock:
+            self._playing_job = job
+        try:
+            return self._play_job_inner(job, gen)
+        finally:
             with self._lock:
-                self._state.rate_pct = rate
+                if self._playing_job is job:
+                    self._playing_job = None
+
+    def _play_job_inner(self, job: TtsJob, gen: int) -> bool:
+        resampler = None
+        tail = np.zeros(0, dtype=np.float32)   # sobra retida do trecho anterior
+        t_dead = time.monotonic() + self._SYNTH_DEADLINE_S
+        started = False     # já entregou algo ao mixer (fade de entrada só no 1º)
+        checked = False     # backlog/rate_pct já tratados para este job
+        while True:
+            if not self._alive(gen):
+                job.cancel()
+                return False
+            if job.cancelled.is_set():
+                return True
+            item = job.get(timeout=0.2)
+            if item is JOB_END:
+                break
+            if item is None:
+                if time.monotonic() >= t_dead:
+                    log.warning("síntese passou de %.0fs, frase pulada",
+                                self._SYNTH_DEADLINE_S)
+                    job.cancel()
+                    break
+                continue
+            pcm, sr, last = item
+            if resampler is None or resampler.sr_from != sr:
+                if resampler is not None:   # troca de taxa no meio: esvazia a antiga
+                    tail = np.concatenate((tail, resampler.flush()))
+                resampler = dsp.StreamResampler(sr, SR_NATIVE)
+            out = np.concatenate((tail, resampler.process(pcm)))
+            if last:
+                out = np.concatenate((out, resampler.flush()))
+                resampler = None
+                tail = np.zeros(0, dtype=np.float32)
+            elif out.size > self._PLAY_TAIL_SAMPLES:
+                tail = out[-self._PLAY_TAIL_SAMPLES:]
+                out = out[:-self._PLAY_TAIL_SAMPLES]
+            else:
+                tail, out = out, np.zeros(0, dtype=np.float32)
+            if not checked and (out.size or last):
+                checked = True
+                # proteção de atraso máximo: descarta fila antiga e avisa
+                if self._mixer.tts_backlog_seconds() > self.config.max_backlog_s:
+                    log.warning("backlog > %.0fs, pulando para o ao vivo",
+                                self.config.max_backlog_s)
+                    self._mixer.clear_tts()
+                with self._lock:
+                    self._state.rate_pct = job.rate
+            if out.size:
+                self._enqueue_chunk(out, first=not started, last=last)
+                started = True
+            if last:
+                break
+        if job.cancelled.is_set():
+            return True
+        if resampler is not None:
+            tail = np.concatenate((tail, resampler.flush()))
+        if tail.size:   # fim sem trecho "último" (falha no meio): fecha com fade
+            self._enqueue_chunk(tail, first=not started, last=True)
+        return True
+
+    def _enqueue_chunk(self, pcm: np.ndarray, first: bool, last: bool) -> None:
+        """Entrega um trecho ao mixer: fade de entrada só no 1º, de saída só no último."""
+        if pcm.size:
+            self._mixer.enqueue_tts(pcm, fade_in=first, fade_out=last)
 
     def _adaptive_rate(self) -> int:
         """Escada de aceleração conforme o atraso acumulado da fila TTS."""
@@ -313,6 +416,9 @@ class Pipeline:
                 log.exception("falha ao carregar componentes")
                 self._set_status(f"erro ao carregar: {exc}")
                 return
+            self._joiner.reset()         # cauda de antes da pausa nunca é falada
+            if self._transcriber is not None:
+                self._transcriber.reset_context()
             if self._tts_pool is None:   # o stop anterior descartou o pool
                 self._tts_pool = ThreadPoolExecutor(
                     max_workers=2, thread_name_prefix="tts-synth")
@@ -366,6 +472,9 @@ class Pipeline:
             except Exception:
                 log.exception("erro ao parar")
             self._threads.clear()
+            self._joiner.reset()
+            if self._transcriber is not None:
+                self._transcriber.reset_context()
             # descarta o que ficou pendente para não tocar áudio velho num restart
             for q in (self._q_asr, self._q_mt, self._q_tts):
                 while True:
@@ -485,7 +594,11 @@ class Pipeline:
         def _load() -> None:
             from tradutor.glossary import Glossary, theme_path
             try:
-                self._glossary = Glossary(theme_path(name))
+                glossary = Glossary(theme_path(name))
+                self._glossary = glossary
+                if self._transcriber is not None:
+                    self._transcriber.set_vocabulary(
+                        glossary.asr_vocabulary if self.config.contexto_asr else "")
                 log.info("glossário trocado para %s", name)
             except Exception:
                 log.exception("falha ao carregar o glossário %s", name)
@@ -607,6 +720,12 @@ class Pipeline:
             self._set_status(f"erro no teste de saída: {exc}")
 
     def skip_to_live(self) -> None:
+        # a frase em andamento também sai: sem isto o worker seguiria
+        # enfileirando o resto dela (sem fade de entrada) depois da limpeza
+        with self._lock:
+            job = self._playing_job
+        if job is not None:
+            job.cancel()
         if self._mixer:
             self._mixer.clear_tts()
 
